@@ -4315,3 +4315,17 @@ gate launched with A=baseline silently inverts the SPRT sign — the
 1,600-game g1 state file was POV-inverted in place (scores mirrored,
 A/B fields swapped; the pairing design is label-symmetric so the
 evidence chain is exact) before the continuation.
+
+
+---
+
+## V1.1 — host/UCI fix release (core unchanged)
+
+`uci.cpp` only; `tacturn/` untouched, `bench 9` = 188,416 on all tiers before and after.
+Tester report (bare exe closed after ~1 s with `FINGERPRINT MISMATCH: expected 33280 nodes at depth 9`) traced to the
+V1 startup self-test: stale 1.3.1 constant (real startpos d9 / contempt 12 / seed 1 = 32,768 nodes) plus exit
+on interactive launch. Removed. Follow-up audit of the host layer found and fixed: searching-flag cleared after
+`bestmove` (dropped next command), lost `stop` before the worker reached `think()` (core clears `stopped_` at
+search start), EOF during `go infinite` hanging, Hash MB→bits rounding up (2x memory), unlimited search on
+negative clock or valueless `go` parameters, unflushed info strings. New `scripts/verify_uci.py` (32 checks)
+passes 32/32 on x86-64 / v3 / v4. See RELEASE-NOTES-V1.md.

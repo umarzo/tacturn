@@ -64,6 +64,8 @@
 #include <vector>
 #include <atomic>
 #include <algorithm>
+#include <type_traits>
+#include <chrono>
 
 #ifdef _WIN32
 #include <io.h>  // _isatty
@@ -287,7 +289,7 @@ static void fuzzGivesCheck(long iterations, uint64_t seed) {
         }
     }
     std::printf("fuzzGivesCheck: %ld positions, %ld quiet moves tested, %ld mismatches\n",
-                positions, tested, mismatch);
+                (long)positions, (long)tested, (long)mismatch);
     std::fflush(stdout);
 }
 
@@ -327,7 +329,15 @@ void formatScore(char *out, size_t outLen, int score) {
 // runGo — runs on the SEARCH WORKER THREAD (main thread keeps stdin)
 // ----------------------------------------------------------------
 int runGo(GameSession &g, const UciOptions &opt, const std::string &goArgs,
-          bool printInfo) {
+          bool printInfo, std::atomic<bool> *searchingFlag = nullptr) {
+    // The "searching" flag MUST drop before bestmove is printed: a GUI sends
+    // its next "position"/"go" the instant it reads bestmove, and anything
+    // that arrives while the flag is still set is ignored as "mid-search".
+    // (V1 cleared it after returning -> rare lost commands / GUI timeouts.)
+    // Nothing below touches the GameSession after this point.
+    auto searchDone = [searchingFlag]() {
+        if (searchingFlag) searchingFlag->store(false, std::memory_order_release);
+    };
     std::istringstream parser(goArgs);
     SearchLimits lim;
     lim.maxDepth = 64;
@@ -339,26 +349,40 @@ int runGo(GameSession &g, const UciOptions &opt, const std::string &goArgs,
     lim.nodeLimit = 0;
 
     std::string tok;
-    int64_t wtime = -1, btime = -1, winc = 0, binc = 0, movesToGo = 0;
+    int64_t wtime = 0, btime = 0, winc = 0, binc = 0, movesToGo = 0;
+    bool hasW = false, hasB = false;   // clock fields actually sent by the GUI
     bool infinite = false;
+    // Safe numeric read: a missing/garbled value (e.g. a bare "go depth")
+    // leaves the default untouched instead of zeroing it, which used to turn
+    // the search into an unlimited one.
+    auto num = [&parser](auto &dst) {
+        long long v;
+        if (parser >> v) dst = (std::remove_reference_t<decltype(dst)>)v;
+        else parser.clear();
+    };
     while (parser >> tok) {
-        if (tok == "depth") parser >> lim.maxDepth;
-        else if (tok == "movetime") parser >> lim.moveTimeMs;
-        else if (tok == "nodes") parser >> lim.nodeLimit;
-        else if (tok == "wtime") parser >> wtime;
-        else if (tok == "btime") parser >> btime;
-        else if (tok == "winc") parser >> winc;
-        else if (tok == "binc") parser >> binc;
-        else if (tok == "movestogo") parser >> movesToGo;   // [CCRL] repeating TCs
+        if (tok == "depth") num(lim.maxDepth);
+        else if (tok == "movetime") num(lim.moveTimeMs);
+        else if (tok == "nodes") num(lim.nodeLimit);
+        else if (tok == "wtime") { num(wtime); hasW = true; }
+        else if (tok == "btime") { num(btime); hasB = true; }
+        else if (tok == "winc") num(winc);
+        else if (tok == "binc") num(binc);
+        else if (tok == "movestogo") num(movesToGo);   // [CCRL] repeating TCs
         else if (tok == "infinite") infinite = true;
         // unknown tokens (ponder etc.) are ignored gracefully
     }
     if (infinite) { lim.maxDepth = 64; lim.moveTimeMs = 0; }
 
-    if (lim.moveTimeMs == 0 && lim.nodeLimit == 0 && (wtime >= 0 || btime >= 0)) {
+    if (lim.moveTimeMs == 0 && lim.nodeLimit == 0 && (hasW || hasB)) {
         int64_t t = g.board.sideToMove == WHITE ? wtime : btime;
         int64_t inc = g.board.sideToMove == WHITE ? winc : binc;
-        if (t < 0) t = 60000;
+        // A negative/zero clock (GUI reporting overtime) means "move now":
+        // clamp to 1 ms instead of falling through to an unlimited search.
+        // If only the opponent's clock was sent, assume 60 s for ours.
+        bool ownSent = g.board.sideToMove == WHITE ? hasW : hasB;
+        if (!ownSent) t = 60000;
+        else if (t < 1) t = 1;
         int64_t soft, hard;
         if (movesToGo > 0) {
             // [CCRL] Period-based (repeating) time control, e.g. 40/15:
@@ -437,9 +461,10 @@ int runGo(GameSession &g, const UciOptions &opt, const std::string &goArgs,
             std::fflush(stdout);
             chosen[lines++] = r.bestMove;
         }
-        if (lines == 0) { std::printf("bestmove (none)\n"); std::fflush(stdout); return 0; }
+        if (lines == 0) { searchDone(); std::printf("bestmove (none)\n"); std::fflush(stdout); return 0; }
         char mv[8];
         moveToUci(chosen[0], mv);
+        searchDone();
         std::printf("bestmove %s\n", mv);
         std::fflush(stdout);
         return 0;
@@ -459,6 +484,7 @@ int runGo(GameSession &g, const UciOptions &opt, const std::string &goArgs,
 
     char mv[8];
     if (r.bestMove == MOVE_NONE) {
+        searchDone();
         std::printf("bestmove (none)\n");
     } else {
         // Final info line with the full TT-walk PV (GUIs display the
@@ -474,12 +500,13 @@ int runGo(GameSession &g, const UciOptions &opt, const std::string &goArgs,
             if (i) pvStr += " ";
             pvStr += p;
         }
-        if (!pvStr.empty()) {
+        if (!pvStr.empty() && r.depth > 0) {
             std::printf("info depth %d %s nodes %llu time %lld pv %s\n",
                         r.depth, sc, (unsigned long long)r.nodes,
                         (long long)r.timeMs, pvStr.c_str());
         }
         moveToUci(r.bestMove, mv);
+        searchDone();
         std::printf("bestmove %s\n", mv);
     }
     std::fflush(stdout);
@@ -498,8 +525,10 @@ int hashMbToBits(long mb) {
     if (mb < 1) mb = 1;
     long entries = mb * 1024 * 1024 / 16;
     int bits = 12;
-    while ((1L << bits) <= entries && bits < 30) bits++;
-    return bits > 30 ? 30 : bits;
+    // largest 2^bits entries that still fit in `mb` MB (round DOWN; the old
+    // loop rounded up and allocated up to 2x the requested Hash).
+    while ((1L << (bits + 1)) <= entries && bits < 30) bits++;
+    return bits;
 }
 
 }  // namespace
@@ -507,31 +536,18 @@ int hashMbToBits(long mb) {
 int main(int argc, char **argv) {
     std::ios::sync_with_stdio(false);
 
-    // Reference mode: no arguments AND interactive terminal -> print
-    // identity + startpos depth-9 fingerprint (the distribution binary
-    // contract). Piped UCI input falls through to the protocol loop.
+    // Interactive console (double-click / bare launch from cmd): UCI engines
+    // are headless, so show a short hint on stderr and then behave like any
+    // other UCI engine -- keep reading commands until "quit" / EOF.
+    // (V1 used to run a startpos "fingerprint" here and exit, which looked
+    // like a crash on double-click and tripped on a stale expected value.
+    // The identity check is `bench 9` -> Total nodes: 188416.)
     if (argc == 1 && isatty(0)) {
-        std::printf("TacTurn host reference build (%s, api v%d)\n",
-                    tacturn_version(), tacturn_api_version());
-        GameSession g(21);
-        g.setFen(Position::START_FEN);
-        SearchLimits lim;
-        lim.maxDepth = 9;
-        lim.moveTimeMs = 0;
-        lim.hardMoveTimeMs = 0;
-        lim.threads = 1;
-        lim.contemptCp = 12;
-        lim.rngSeed = 1;
-        SearchResult r = g.think(lim, nullptr);
-        char mv[8];
-        moveToUci(r.bestMove, mv);
-        std::printf("version=%s depth=9 contempt=12 nodes=%llu best=%08x score=%d\n",
-                    tacturn_version(), (unsigned long long)r.nodes, r.bestMove, r.score);
-        constexpr uint64_t FINGERPRINT_1_3_1 = 33280;
-        if (r.nodes == FINGERPRINT_1_3_1) std::printf("fingerprint OK\n");
-        else std::printf("FINGERPRINT MISMATCH: expected %llu nodes at depth 9\n",
-                         (unsigned long long)FINGERPRINT_1_3_1);
-        return 0;
+        std::fprintf(stderr,
+                     "%s by %s -- UCI chess engine (api v%d).\n"
+                     "Load this exe in a GUI (Cute Chess, Arena, Banksia, ...) or type UCI\n"
+                     "commands here: uci, isready, position, go, bench 9, quit.\n",
+                     tacturn_version(), TACTURN_AUTHOR, tacturn_api_version());
     }
 
     // One-shot bench mode: "tacturn-uci bench [depth]"
@@ -553,6 +569,17 @@ int main(int argc, char **argv) {
     std::thread searchThr;
     std::atomic<bool> searching{false};
 
+    // Stop the running search reliably. The engine core clears its stop flag
+    // when a search *starts*, so a single requestStop() sent right after "go"
+    // (before the worker thread reaches the search) is lost and the search
+    // runs forever. Keep re-sending it until the worker reports it is done.
+    auto stopSearch = [&]() {
+        while (searching.load(std::memory_order_acquire)) {
+            g->requestStop();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+
     std::string line;
     while (std::getline(std::cin, line)) {
         std::istringstream parser(line);
@@ -562,12 +589,12 @@ int main(int argc, char **argv) {
         // ---- Commands honored DURING a search ----
         if (searching.load(std::memory_order_acquire)) {
             if (tok == "stop") {
-                g->requestStop();
+                stopSearch();
             } else if (tok == "isready") {
                 std::printf("readyok\n");
                 std::fflush(stdout);
             } else if (tok == "quit") {
-                g->requestStop();
+                stopSearch();
                 break;
             }
             // Everything else mid-search is not sent by spec-compliant
@@ -667,6 +694,7 @@ int main(int argc, char **argv) {
             if (!fen.empty()) {
                 if (!g->setFen(fen.c_str())) {
                     std::printf("info string invalid FEN\n");
+                    std::fflush(stdout);
                     continue;
                 }
             }
@@ -678,6 +706,7 @@ int main(int argc, char **argv) {
                 Move m = findUciMove(*g, mstr.c_str());
                 if (m == MOVE_NONE) {
                     std::printf("info string illegal move %s\n", mstr.c_str());
+                    std::fflush(stdout);
                     break;
                 }
                 g->makeMove(m);
@@ -710,7 +739,7 @@ int main(int argc, char **argv) {
             if (searchThr.joinable()) searchThr.join();
             searching.store(true, std::memory_order_release);
             searchThr = std::thread([&g, &opt, &searching, rest]() {
-                runGo(*g, opt, rest, true);
+                runGo(*g, opt, rest, true, &searching);
                 searching.store(false, std::memory_order_release);
             });
             continue;  // main thread keeps reading stdin during the search
@@ -764,6 +793,9 @@ int main(int argc, char **argv) {
         }
         std::fflush(stdout);
     }
+    // stdin closed (GUI died) or "quit": never wait on a running search
+    // (e.g. "go infinite") -- ask it to stop, then join.
+    stopSearch();
     if (searchThr.joinable()) searchThr.join();
     delete g;
     return 0;

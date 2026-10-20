@@ -31,6 +31,18 @@ runtime installers). All three tiers are **bit-identical in play strength
 behavior** — the deterministic bench suite returns exactly the same node
 counts on every tier (see *Verification* below); only raw speed differs.
 
+## How to run it
+
+TacTurn is a **headless UCI engine** — it has no board or window of its own.
+Load the `.exe` in a chess GUI (Cute Chess, Arena, Banksia, En Croissant, …)
+via *Engines → Add engine*. Double-clicking it (or launching it from a
+console) opens a command window that waits for UCI commands — type `uci`,
+`isready`, `bench 9` or `quit`. **V1.1:** earlier V1 files ran a startup
+self-test and closed right after launch; that is fixed.
+
+If a file will not start, use the next tier down (v4 → v3 → plain
+`x86-64`).
+
 ## What kind of engine is this?
 
 TacTurn is a bitboard engine (magic bitboards generated at init, runtime
@@ -75,7 +87,7 @@ assigned by the list itself; treat this only as the author's estimate.
 
 | Option | Type | Default | Notes |
 |---|---|---|---|
-| `Hash` | spin (MB) | 32 | 1–32768 MB. CCRL uses 256 or 512 — supported. |
+| `Hash` | spin (MB) | 32 | 1–32768 MB. CCRL uses 256 or 512 — supported. Table size is rounded down to a power of two (256 → 256 MB, 100 → 64 MB). |
 | `Threads` | spin | 1 | 1–8 (Lazy SMP). Use 1 for single-CPU lists, 4 for 4-CPU. |
 | `Contempt` | spin | 12 | −200–200 cp. Keep default for rating play. |
 | `UseNNUE` | check | true | `false` = pure HCE (the hybrid's ablation reference). |
@@ -105,10 +117,12 @@ Notes for testers:
 - NNUE inference verified bit-exact against a double-precision reference
   on random playout batteries; SEE short-circuit verified against exact
   swap-off lists; gives-check predicate verified against post-make truth.
-- A 30-point UCI protocol compliance suite (handshake, options, position
+- A 32-check UCI protocol compliance suite (handshake, options, position
   handling, all `go` modes, mid-search stop/quit, MultiPV, mate reporting,
-  malformed-input robustness) passes 30/30 — see
-  `UCI-COMPLIANCE-REPORT.md`.
+  malformed-input robustness, stop-right-after-go, closed-stdin shutdown,
+  Hash memory sizing) passes 32/32 on all three Linux tiers — see
+  `UCI-COMPLIANCE-REPORT.md`. Re-run it yourself:
+  `python3 scripts/verify_uci.py ./TacTurn-V1-x86-64-v3`.
 
 ## Building from source
 
