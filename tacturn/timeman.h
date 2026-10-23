@@ -221,9 +221,14 @@ public:
         if (unstable_) scale = 1.0;
         if (scale < 0.50) scale = 0.50;
         paceMs_ = (int64_t)(softBudgetMs_ * scale);
-        if (paceMs_ > hardCapMs_) paceMs_ = hardCapMs_;  // never pace past the wall
+        // v1.4.11 fix (order): apply the pacing floor BEFORE the hard-cap
+        // clamp. The old order could lift paceMs_ back above hardCapMs_
+        // whenever the floor exceeded the cap (small base budgets), letting
+        // iteration-start decisions reference a pacing budget the hard wall
+        // would immediately abort — wasted budget that could not be banked.
         int64_t softFloor = baseMs_ < 40 ? baseMs_ : 40;
         if (paceMs_ < softFloor) paceMs_ = softFloor;
+        if (paceMs_ > hardCapMs_) paceMs_ = hardCapMs_;  // never pace past the wall
 
         if (elapsedMs + estMs <= paceMs_) {
             // v1.4.7: the redundant 95% cut on paceMs_ is gone (the same

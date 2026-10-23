@@ -171,6 +171,20 @@ inline std::chrono::steady_clock::time_point msToDeadline(int64_t ms) {
     return std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
 }
 
+// v1.4.11 CRITICAL FIX: an ABSOLUTE wall-clock deadline at epoch-ms
+// `absMs` (a nowMs()-based timestamp). msToDeadline() builds a deadline
+// RELATIVE to now(); feeding it `startMs + cap` (an epoch timestamp plus
+// a duration) produced now() + startMs + cap — a deadline one full
+// steady_clock uptime in the future. Every post-first-iteration re-arm of
+// the hard deadline used that form, so the hard wall NEVER fired after
+// the first iteration completed: an iteration whose cost estimate missed
+// (tactical explosions — aspiration fail cascades, sacrifice chains, deep
+// forcing lines: exactly the sharp positions that decide winning games)
+// ran unbounded, and the engine flagged. This helper restores the wall.
+inline std::chrono::steady_clock::time_point deadlineAt(int64_t absMs) {
+    return std::chrono::steady_clock::time_point(std::chrono::milliseconds(absMs));
+}
+
 // ------------------------------------------------------------------
 // v1.1 quiet-check prefilter — does a QUIET (non-capture, non-promo,
 // non-castle) move give check, computed on the PRE-move board?
@@ -321,6 +335,20 @@ struct Searcher::Worker {
     static constexpr int CORR_LIMIT = 1024;
     int16_t corrPawn[2][CORR_BUCKETS][384];
     int16_t corrNonPawn[2][2][CORR_BUCKETS][384];
+    // v1.4.10 lever: CONTINUATION correction history. The pawn/non-pawn
+    // tables above key the correction by material PLACEMENT (pawn key /
+    // non-pawn keys); this table keys it by the opponent's last move
+    // (piece-to of stack[ply-1], the exact key space the continuation
+    // ORDERING histories use). The same structural error (static eval
+    // systematically off in a recognizable context) often depends on what
+    // just happened, not only on where the pieces sit: a recapture context,
+    // a piece landing on a fresh outpost square, a threat the eval has not
+    // priced. [stm][prevMovePieceTo * 384 + ownPieceTo] — 2 x 147456 x 2B
+    // = 576 KB per worker. Read in corrSumOnly (all own pieces, like the
+    // other corr tables), taught in updateCorr (same cells, same gravity,
+    // same bonus). POV-clean by the v1.4.7 [stm] keying. Never aged (the
+    // v1.4.5 persistence regime the other corr tables follow).
+    int16_t corrCont[2 * 147456];
 
     // ---- per-ply buffers ----
     Move movesBuf[MAX_PLY][MAX_MOVES];
@@ -404,6 +432,7 @@ struct Searcher::Worker {
         memset(counterMoves, 0, sizeof(counterMoves));
         memset(corrPawn, 0, sizeof(corrPawn));
         memset(corrNonPawn, 0, sizeof(corrNonPawn));
+        memset(corrCont, 0, sizeof(corrCont));
         memset(evalCache, 0, sizeof(evalCache));
     }
 
@@ -624,7 +653,23 @@ struct Searcher::Worker {
     int correctedEval() {
         int raw = rawEvalCached();
         if (!USE_CORRHIST) return raw;
-        return raw + corrSumOnly();
+        return raw + corrSumOnly(corrPly_);
+    }
+
+    // v1.4.10: the ply of the innermost search frame (set at every
+    // alphaBeta/quiesce entry) — the continuation corr key reads
+    // stack[ply-1], the move that led into this node.
+    int corrPly_ = 0;
+
+    /** v1.4.10: the continuation-corr base index for the current node
+     *  (opponent's last move piece-to key), or -1 when there is no
+     *  usable context (root, null-move parent, exotic). */
+    inline int corrContBase(int ply) const {
+        if (ply < 1) return -1;
+        Move p = stack[ply - 1];
+        if (p == MOVE_NONE || movePiece(p) >= 6) return -1;
+        return pos->sideToMove * 147456 +
+               (movePiece(p) * 64 + moveTo(p)) * 384;
     }
 
     /** v1.4.0 lever: the live correction-history sum alone (no raw eval).
@@ -635,10 +680,22 @@ struct Searcher::Worker {
      *  corrections are learned all search long, so a stored corrected
      *  eval goes stale within seconds (and across moves of a game the
      *  table outlives, it is stale by construction). */
-    int corrSumOnly() {
+    int corrSumOnly(int ply) {
         if (!USE_CORRHIST) return 0;
         int us = pos->sideToMove;
         int them = us ^ 1;
+        // v1.4.10: continuation table base (opponent's last move context).
+        const int16_t *cT = nullptr;
+        int cBase = corrContBase(ply);
+        if (cBase >= 0) cT = corrCont + cBase;
+        // v1.4.10: the cont correction sums SEPARATELY at HALF the corr
+        // weight — the pawn/non-pawn divisor was tuned for a two-table
+        // sum, and folding a third full-amplitude table into the same
+        // sums over-corrects (bench d9 +23% nodes: evals noisier, pruning
+        // less effective). Half weight keeps the total correction
+        // magnitude inside the tuned envelope while the new context
+        // signal still lands.
+        int contSum = 0;
         // v1.4.7: [stm]-keyed tables (see the declaration note) — a cell
         // written by White's search is now only ever read by White's
         // search, in White's POV.
@@ -655,6 +712,7 @@ struct Searcher::Worker {
             int sq = lsb(pw);
             pw &= pw - 1;
             pawnSum += pT[sq];
+            if (cT) contSum += cT[sq];
         }
         Bitboard np = pos->colorBb[us] & ~pos->pieceBb[PAWN];
         while (np) {
@@ -663,11 +721,13 @@ struct Searcher::Worker {
             int idx = (pos->pieceAt[sq] & 7) * 64 + sq;
             pawnSum += pT[idx];
             npSum += nT[idx] + eT[idx];
+            if (cT) contSum += cT[idx];
         }
         // v5.3: divisor exposed as tuning::g.corrWeight (UCI CorrWeight);
         // 1024 = the shipped constant (probed 512 at 50 ms: -26.5 ± 25.7,
         // rejected — the weight is already at its optimum).
-        return pawnSum / p.corrWeight + npSum / p.corrWeight;
+        return pawnSum / p.corrWeight + npSum / p.corrWeight +
+               contSum / (p.corrWeight * 2);
     }
 
     static inline int16_t corrGravity(int16_t h, int b) {
@@ -690,7 +750,7 @@ struct Searcher::Worker {
      * pawn-key and own-nonpawn-key tables. (An earlier version indexed by the
      * best move's piece/to-square — cells the application never reads for
      * that position — which turned the whole mechanism into noise.) */
-    void updateCorr(int depth, int diff) {
+    void updateCorr(int ply, int depth, int diff) {
         if (!USE_CORRHIST) return;
         int bonus = clampI(diff * (depth + 4) / 8, -512, 512);
         if (bonus == 0) return;
@@ -702,11 +762,15 @@ struct Searcher::Worker {
         int16_t *pT = corrPawn[us][pos->pawnKey & CORR_MASK];
         int16_t *nT = corrNonPawn[us][us][pos->nonPawnKey[us] & CORR_MASK];
         int16_t *eT = corrNonPawn[us][them][pos->nonPawnKey[them] & CORR_MASK];
+        // v1.4.10: continuation cells for THIS node's context (may be null).
+        int cBase = corrContBase(ply);
+        int16_t *cT = cBase >= 0 ? corrCont + cBase : nullptr;
         Bitboard pw = pos->colorBb[us] & pos->pieceBb[PAWN];
         while (pw) {
             int sq = lsb(pw);
             pw &= pw - 1;
             pT[sq] = corrGravity(pT[sq], bonus);
+            if (cT) cT[sq] = corrGravity(cT[sq], bonus);
         }
         Bitboard np = pos->colorBb[us] & ~pos->pieceBb[PAWN];
         while (np) {
@@ -716,13 +780,14 @@ struct Searcher::Worker {
             pT[idx] = corrGravity(pT[idx], bonus);
             nT[idx] = corrGravity(nT[idx], bonus);
             eT[idx] = corrGravity(eT[idx], bonus);
+            if (cT) cT[idx] = corrGravity(cT[idx], bonus);
         }
     }
 
     /** v1.4.7: correction update on the POV-fixed tables. See the body
      *  note for why the theoretically-sound "bound coherence" gates were
      *  measured and rejected for this engine. */
-    void updateCorrGated(Move bestMove, int depth, int bestScore, int staticEval,
+    void updateCorrGated(Move bestMove, int ply, int depth, int bestScore, int staticEval,
                          int alphaOrig, int beta) {
         // v1.4.7: POV-fixed tables, UNCONDITIONAL update. The bound
         // "coherence" gates that pair with this fix in theory (skip
@@ -738,7 +803,7 @@ struct Searcher::Worker {
         (void)alphaOrig;
         (void)beta;
         if (!USE_CORRHIST) return;
-        updateCorr(depth, bestScore - staticEval);
+        updateCorr(ply, depth, bestScore - staticEval);
     }
 
     /** v1.4.7: full history/correction/eval-cache reset for ucinewgame.
@@ -762,6 +827,7 @@ struct Searcher::Worker {
         memset(counterMoves, 0, sizeof(counterMoves));
         memset(corrPawn, 0, sizeof(corrPawn));
         memset(corrNonPawn, 0, sizeof(corrNonPawn));
+        memset(corrCont, 0, sizeof(corrCont));
         memset(evalCache, 0, sizeof(evalCache));
     }
 
@@ -819,6 +885,11 @@ struct Searcher::Worker {
     SearchResult runThink(const std::function<void(const IterationInfo &)> &onIteration) {
         SearchResult result;
         startMs = nowMs();
+        // The pre-run work outside this function (worker prepare sweeps,
+        // ~2-4 ms) is deliberately NOT counted against the budget here: it
+        // is bounded, memory-bandwidth-bound, and rides inside the caller's
+        // overhead reserve (the clock formulas reserve 60+ ms). Counting it
+        // would silently tax every fixed-movetime request the same amount.
         int64_t budgetMs = hardMs > 0 ? hardMs : moveTimeMs;
         hardDeadline = budgetMs > 0 ? msToDeadline(budgetMs)
                                     : std::chrono::steady_clock::time_point::max();
@@ -892,7 +963,11 @@ struct Searcher::Worker {
                                                      prevIterScore, aspirationFails >= 2,
                                                      bestMoveNodesPm, gap, lim.lastScore))
                         break;
-                    hardDeadline = msToDeadline(startMs + tm->iterationCapMs(completedDepth));
+                    // v1.4.11: the re-arm used msToDeadline(startMs + cap),
+                    // which added the full steady_clock uptime to the wall —
+                    // the hard deadline never fired after the first
+                    // iteration. Absolute form:
+                    hardDeadline = deadlineAt(startMs + tm->iterationCapMs(completedDepth));
                 } else if (limits.hardMoveTimeMs <= 0) {
                     // Fixed movetime: start an iteration whenever it is
                     // expected to fit in the REMAINING budget — the full
@@ -1240,6 +1315,7 @@ struct Searcher::Worker {
         int depth = depthIn;
         int alpha = alphaIn;
         int beta = betaIn;
+        corrPly_ = ply;  // v1.4.10: continuation-corr context ply
 
         checkStop();
         if (stopped()) return 0;
@@ -1384,7 +1460,7 @@ struct Searcher::Worker {
             ttEvalStore = TranspositionTable::EVAL_NONE;
         } else if (ttEval != TranspositionTable::EVAL_NONE) {
             // v1.4.0: stored raw+residual + the CURRENT correction sum.
-            staticEval = ttEval + corrSumOnly();
+            staticEval = ttEval + corrSumOnly(ply);
             ttEvalStore = ttEval;  // already the store semantics — pass through
         } else if (nnue::enabled && nnue::staticBlendPct > 0) {
             // v5.1 experiment: inject the residual into the MAIN-SEARCH
@@ -1396,12 +1472,12 @@ struct Searcher::Worker {
             // helpers are pure/idempotent, so this is bit-identical.
             int rawV = rawEvalCached();
             int resV = staticResidualInject();
-            staticEval = (USE_CORRHIST ? rawV + corrSumOnly() : rawV) + resV;
+            staticEval = (USE_CORRHIST ? rawV + corrSumOnly(ply) : rawV) + resV;
             ttEvalStore = rawV + resV;
             owner->tt_.storeEval(pos->key, ttEvalStore);
         } else {
             int rawV = rawEvalCached();
-            staticEval = USE_CORRHIST ? rawV + corrSumOnly() : rawV;
+            staticEval = USE_CORRHIST ? rawV + corrSumOnly(ply) : rawV;
             ttEvalStore = rawV;
             owner->tt_.storeEval(pos->key, ttEvalStore);
         }
@@ -1647,6 +1723,31 @@ struct Searcher::Worker {
             }
         }
 
+        // v1.4.10 lever: SINGLE-REPLY EXTENSION. Every legal evasion of a
+        // check is a king move, an en-passant capture, or a move landing on
+        // the checker's square / a between-square (the evasionMask set —
+        // the exact superset the v1.4.4 provably-illegal skip uses). When
+        // the pseudo-legal list contains EXACTLY ONE such candidate, the
+        // node has at most one legal move: if the candidate is legal the
+        // reply is FORCED, and the forced line can afford to keep its full
+        // depth (childDepth = depth instead of depth-1) — the classic
+        // single-reply extension. Mutually exclusive with the singular
+        // extension by construction (singular is gated on !inCheck), so
+        // the two never stack.
+        Move singleReplyMove = MOVE_NONE;
+        if (inCheck) {
+            int candidates = 0;
+            for (int i = 0; i < count && candidates <= 1; i++) {
+                Move m = moves[i];
+                if (movePiece(m) != KING && !isEPMove(m) &&
+                    !(evasionMask & bitOf(moveTo(m))))
+                    continue;
+                candidates++;
+                singleReplyMove = m;
+            }
+            if (candidates != 1) singleReplyMove = MOVE_NONE;
+        }
+
         // v1.4.1 staged ordering (bit-exact): when a TT move is present in
         // the generated list, try it FIRST — before scoring the whole list.
         // The selection sort always picks the ttMove first anyway (its
@@ -1699,9 +1800,12 @@ struct Searcher::Worker {
                 stack[ply] = move;
                 if (quiet) quietCount = 1;
                 if (quiet || capture) tried[triedCount++] = move;
-                // Singular extension applies to the TT move.
+                // Singular extension applies to the TT move; the
+                // single-reply extension applies at in-check nodes (the
+                // two are mutually exclusive — singular needs !inCheck).
                 int childDepth =
-                    depth - 1 + (singular ? singularExt : 0);
+                    depth - 1 + (singular ? singularExt : 0) +
+                    (singleReplyMove != MOVE_NONE && move == singleReplyMove ? 1 : 0);
                 // v1.4.2 fix (cutNode alternation): the first legal child
                 // of a non-PV node was hardcoded cutNode=false, so every
                 // All-node's first child — the expected CUTTER — was
@@ -1725,7 +1829,7 @@ struct Searcher::Worker {
                                                       depth, ply);
                                 }
                                 if (!inCheck && abs(bestScore) < Searcher::MATE_BOUND) {
-                                    updateCorrGated(move, depth, bestScore, staticEval,
+                                    updateCorrGated(move, ply, depth, bestScore, staticEval,
                                                     alphaOrig, beta);
                                 }
                                 owner->tt_.store(pos->key, move, scoreToTT(bestScore, ply),
@@ -2012,7 +2116,10 @@ struct Searcher::Worker {
                 reduce = clampI(r, 0, 8);
             }
 
-            int childDepth = depth - 1 + (singularMove ? singularExt : 0);
+            int childDepth = depth - 1 + (singularMove ? singularExt : 0) +
+                             (singleReplyMove != MOVE_NONE && move == singleReplyMove
+                                  ? 1
+                                  : 0);
             // (v1.2 tested: passed-pawn-to-7th extension LOST -24.4 ± 6.4
             // on this stack — extensions keep losing to this search's
             // LMR ordering; consistent with the project's history.)
@@ -2075,7 +2182,7 @@ struct Searcher::Worker {
                                 updateCutoffStats(move, quiet, tried, triedCount, depth, ply);
                             }
                             if (!inCheck && abs(bestScore) < Searcher::MATE_BOUND) {
-                                updateCorrGated(move, depth, bestScore, staticEval,
+                                updateCorrGated(move, ply, depth, bestScore, staticEval,
                                                 alphaOrig, beta);
                             }
                             owner->tt_.store(pos->key, move, scoreToTT(bestScore, ply), depth,
@@ -2103,7 +2210,7 @@ struct Searcher::Worker {
             // static eval was too optimistic about this structure.
             if (!inCheck && bestMoveLocal != MOVE_NONE &&
                 abs(bestScore) < Searcher::MATE_BOUND) {
-                updateCorrGated(bestMoveLocal, depth, bestScore, staticEval, alphaOrig,
+                updateCorrGated(bestMoveLocal, ply, depth, bestScore, staticEval, alphaOrig,
                                 beta);
             }
             int flag = bestScore >= beta   ? TranspositionTable::FLAG_LOWER
@@ -2129,6 +2236,7 @@ struct Searcher::Worker {
     // ------------------------------------------------------------------
 
     int quiesce(int alphaIn, int beta, int ply, int qply) {
+        corrPly_ = ply;  // v1.4.10: continuation-corr context ply
         checkStop();
         if (stopped()) return 0;
         if (ply >= MAX_PLY_GUARD) return leafEval();
@@ -2190,7 +2298,7 @@ struct Searcher::Worker {
             if (ttEval != TranspositionTable::EVAL_NONE) {
                 // v1.4.0: stored raw+residual + the CURRENT correction sum.
                 ttEvalStore = ttEval;  // pass-through (already store semantics)
-                best = ttEval + corrSumOnly();
+                best = ttEval + corrSumOnly(ply);
             } else {
                 // v1.4.1 fix: compute the bounded leaf eval FIRST so the
                 // far-boundary NNUE skip inside leafEvalBoundedFrom is
@@ -2206,7 +2314,7 @@ struct Searcher::Worker {
                 // previously stored valid eval, so every stored eval keeps
                 // the uniform raw+static-residual semantics.
                 int rawV = rawEvalCached();
-                int corrected = USE_CORRHIST ? rawV + corrSumOnly() : rawV;
+                int corrected = USE_CORRHIST ? rawV + corrSumOnly(ply) : rawV;
                 best = leafEvalBoundedFrom(alphaIn, beta, corrected);
                 ECEntry &ec = evalCache[pos->key & EC_MASK];
                 ttEvalStore =
@@ -2942,8 +3050,15 @@ SearchResult Searcher::think(
         if (legal == 1) {
             SearchLimits cut;
             cut.maxDepth = limits.maxDepth < 10 ? limits.maxDepth : 10;
-            cut.moveTimeMs = limits.moveTimeMs < 120 ? limits.moveTimeMs : 120;
-            cut.threads = limits.threads;
+            // v1.4.11: 120 -> 30 ms cap, single thread. With exactly one
+            // legal move the search cannot change the choice — the whole
+            // call exists only to publish a score/PV for the caller. The
+            // old 120 ms / full-threads shortcut burned a forced move's
+            // entire budget (sweep + 7 helper spawns included) on clocked
+            // games — pure clock bleed exactly in the forcing lines that
+            // winning endgames are made of.
+            cut.moveTimeMs = limits.moveTimeMs < 30 ? limits.moveTimeMs : 30;
+            cut.threads = 1;
             cut.contemptCp = limits.contemptCp;  // keep analysis truth (0) vs play (12)
             effLimits = cut;
         }
