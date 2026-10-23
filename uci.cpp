@@ -169,6 +169,9 @@ struct UciOptions {
     int hashMb = 32;        // advertised value, MB — keep in sync with hashBits
     int threads = 1;
     int contempt = 12;
+    // v1.4.11: per-move overhead reserved from the clock (safety margin of
+    // the flag-proof pacing). Raise it on slow hosts / slow GUIs / network.
+    int moveOverhead = 60;
     bool useNnue = true;
     int blend = -1;         // -1 = compiled default
     int staticBlend = -1;   // -1 = compiled default
@@ -383,33 +386,52 @@ int runGo(GameSession &g, const UciOptions &opt, const std::string &goArgs,
         bool ownSent = g.board.sideToMove == WHITE ? hasW : hasB;
         if (!ownSent) t = 60000;
         else if (t < 1) t = 1;
-        int64_t soft, hard;
+        // v1.4.11: flag-proof clock pacing (two-reserve accounting).
+        //   safety      - hard-cap reserve for the overhead TAIL (option
+        //                 Move Overhead, default 60 ms, scaled down on tiny
+        //                 clocks). `hard` never spends into it.
+        //   EXPECTED_OH - the EXPECTED per-move overhead (4 ms), used in the
+        //                 sustainability math so the soft budget nets to zero
+        //                 drain whenever the increment covers the overhead.
+        //   mtg         - moves-to-go: the GUI's real `movestogo` when sent
+        //                 (repeating TCs such as 40/15), otherwise an estimate
+        //                 aged through the game (45 -> 25), with an emergency
+        //                 thin spread (60) on a depleted no-increment clock.
+        constexpr int64_t EXPECTED_OH = 4;
+        int64_t safety = opt.moveOverhead;
+        if (safety > t / 4) safety = t / 4;      // tiny clocks: keep a quarter
+        if (safety < 2) safety = t > 2 ? 2 : 1;
+        int64_t avail = t - safety;              // what the search may spend
+        if (avail < 1) avail = 1;
+
+        int mtg;
         if (movesToGo > 0) {
-            // [CCRL] Period-based (repeating) time control, e.g. 40/15:
-            // the GUI tells us how many moves remain until the clock
-            // resets. Spread the remaining time across them; the hard cap
-            // bounds a single unstable move so a period can never be lost
-            // to a couple of long thinks.
-            int64_t m = movesToGo > 60 ? 60 : movesToGo;
-            soft = t / (m + 2) + (inc * 3) / 4;
-            if (soft < 20) soft = 20;
-            hard = soft * 3;
-            if (hard > t / 4) hard = t / 4;
-            if (hard < soft) hard = soft;
-            if (hard > t - 50) hard = t - 50;
-            if (hard < soft) hard = soft;
+            mtg = (int)(movesToGo > 60 ? 60 : movesToGo) + 2;   // [CCRL] period TC
         } else {
-            // Legacy v1.4.9 allocation for increment-only clocks —
-            // bit-identical to the tested behavior.
-            soft = t / 25 + (inc * 3) / 4;
-            if (soft < 20) soft = 20;
-            hard = t / 8;
-            if (hard < soft * 2) hard = soft * 2;
-            if (hard > t - 50) hard = t - 50;
-            if (hard < soft) hard = soft;
+            int ply = (int)g.records.size();
+            mtg = 45 - ply / 4;                  // ply 80 (move 40) -> 25
+            if (mtg < 25) mtg = 25;
+            if (t < 500 && inc < t / 4) mtg = 60; // emergency: thin spread
         }
+        int64_t einc = inc - EXPECTED_OH;
+        if (einc < 0) einc = 0;
+
+        int64_t soft = avail / mtg + einc;
+        int64_t cap = avail * 2 / 5;             // never dump a huge share on one move
+        if (cap < einc) cap = einc;
+        if (cap > avail) cap = avail;
+        if (soft > cap) soft = cap;
+        if (soft < 1) soft = 1;
+
+        int64_t hard = avail / 8;                // burst headroom (~12% of clock)
+        if (hard < soft * 3) hard = soft * 3;
+        if (hard > avail) hard = avail;          // NEVER past the reserve
+        if (hard < soft) hard = soft;
+
         lim.moveTimeMs = soft;
         lim.hardMoveTimeMs = hard;
+        // v1.4.11: in time trouble the depth floor shrinks too.
+        lim.depthFloor = soft < 120 ? 4 : 8;
         // v1.4.0: clocked play uses the adaptive time manager (the app's
         // play mode) — the soft/hard split above becomes the tm's base/cap.
         lim.adaptiveTime = true;
@@ -541,7 +563,7 @@ int main(int argc, char **argv) {
     // other UCI engine -- keep reading commands until "quit" / EOF.
     // (V1 used to run a startpos "fingerprint" here and exit, which looked
     // like a crash on double-click and tripped on a stale expected value.
-    // The identity check is `bench 9` -> Total nodes: 188416.)
+    // The identity check is `bench 9` -> Total nodes: 171520.)
     if (argc == 1 && isatty(0)) {
         std::fprintf(stderr,
                      "%s by %s -- UCI chess engine (api v%d).\n"
@@ -611,6 +633,8 @@ int main(int argc, char **argv) {
             std::printf("option name Threads type spin default 1 min 1 max 8\n");
             std::printf("option name Contempt type spin default %d min -200 max 200\n",
                         opt.contempt);
+            std::printf("option name Move Overhead type spin default %d min 0 max 10000\n",
+                        opt.moveOverhead);
             std::printf("option name UseNNUE type check default true\n");
             std::printf("option name NNUEBlend type spin default %d min 0 max 100\n",
                         nnue::blendPct);
@@ -661,6 +685,9 @@ int main(int argc, char **argv) {
                 opt.threads = std::max(1, std::min(8, std::atoi(value.c_str())));
             } else if (name == "Contempt") {
                 opt.contempt = std::atoi(value.c_str());
+            } else if (name == "Move Overhead" || name == "MoveOverhead") {
+                int ov = std::atoi(value.c_str());
+                opt.moveOverhead = ov < 0 ? 0 : (ov > 10000 ? 10000 : ov);
             } else if (name == "UseNNUE") {
                 opt.useNnue = (value == "true" || value == "1");
                 applyOptions(opt);

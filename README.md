@@ -1,4 +1,4 @@
-# TacTurn V1
+# TacTurn V1.1
 
 A UCI chess engine — **hybrid evaluation: hand-crafted eval (HCE) base with an
 NNUE residual network on top** — 100% original C++17, MIT licensed.
@@ -22,9 +22,9 @@ NNUE residual network on top** — 100% original C++17, MIT licensed.
 
 | File | Requires | Works on |
 |---|---|---|
-| `TacTurn-V1-x86-64.exe` / `TacTurn-V1-x86-64` | any x86-64 CPU (SSE2) | anything from ~2003 onwards |
-| `TacTurn-V1-x86-64-v3.exe` / `TacTurn-V1-x86-64-v3` | AVX2 + BMI2 (Haswell, 2013+) | **recommended** — e.g. Core i7-4770k and anything newer |
-| `TacTurn-V1-x86-64-v4.exe` / `TacTurn-V1-x86-64-v4` | AVX-512 (Ice Lake / Zen 4+) | modern CPUs only |
+| `TacTurn-V1.1-x86-64.exe` / `TacTurn-V1.1-x86-64` | any x86-64 CPU (SSE2) | anything from ~2003 onwards |
+| `TacTurn-V1.1-x86-64-v3.exe` / `TacTurn-V1.1-x86-64-v3` | AVX2 + BMI2 (Haswell, 2013+) | **recommended** — e.g. Core i7-4770k and anything newer |
+| `TacTurn-V1.1-x86-64-v4.exe` / `TacTurn-V1.1-x86-64-v4` | AVX-512 (Ice Lake / Zen 4+) | modern CPUs only |
 
 All Windows builds are static (`KERNEL32` + `msvcrt` only — no DLL hell, no
 runtime installers). All three tiers are **bit-identical in play strength
@@ -79,9 +79,12 @@ falling-eval extension.
 ## Strength
 
 Internal head-to-head estimates put V1 at roughly **~3250 Elo under
-CCRL 40/15-like conditions** (self-anchored, SPRT-gated development
-ladder — full ledger in `HISTORY.md`). The CCRL rating will of course be
-assigned by the list itself; treat this only as the author's estimate.
+CCRL 40/15-like conditions** (self-anchored, SPRT-gated development ladder —
+full ledger in `HISTORY.md`). V1.1 adds two search levers (+8.6 ± 6.0 Elo at
+100 ms, n=1973) and a rebuilt, flag-proof clock manager: the earlier clock
+pacing flagged 16/16 bullet (1+0) self-play games and V1.1 flags 0/16 (see
+`HISTORY.md` §47–48). The CCRL rating will of course be assigned by the list
+itself; treat all of this only as the author's estimate.
 
 ## UCI options
 
@@ -89,6 +92,7 @@ assigned by the list itself; treat this only as the author's estimate.
 |---|---|---|---|
 | `Hash` | spin (MB) | 32 | 1–32768 MB. CCRL uses 256 or 512 — supported. Table size is rounded down to a power of two (256 → 256 MB, 100 → 64 MB). |
 | `Threads` | spin | 1 | 1–8 (Lazy SMP). Use 1 for single-CPU lists, 4 for 4-CPU. |
+| `Move Overhead` | spin (ms) | 60 | 0–10000. Safety margin reserved from every clock so the engine never flags; raise it on slow machines/GUIs. |
 | `Contempt` | spin | 12 | −200–200 cp. Keep default for rating play. |
 | `UseNNUE` | check | true | `false` = pure HCE (the hybrid's ablation reference). |
 | `NNUEBlend` | spin | 77 | Residual blend in the main eval. Keep default. |
@@ -111,7 +115,7 @@ Notes for testers:
 
 - **Perft**: standard 6-position suite bit-exact (startpos perft(5) =
   4,865,609; Kiwipete perft(4) = 4,085,603; promotion/EP torture included).
-- **Deterministic bench fingerprint**: `<engine> bench 9` = **188,416
+- **Deterministic bench fingerprint**: `<engine> bench 9` = **171,520
   total nodes** on every ISA tier and platform — identical node counts
   across builds prove identical search behavior.
 - NNUE inference verified bit-exact against a double-precision reference
@@ -122,7 +126,7 @@ Notes for testers:
   malformed-input robustness, stop-right-after-go, closed-stdin shutdown,
   Hash memory sizing) passes 32/32 on all three Linux tiers — see
   `UCI-COMPLIANCE-REPORT.md`. Re-run it yourself:
-  `python3 scripts/verify_uci.py ./TacTurn-V1-x86-64-v3`.
+  `python3 scripts/verify_uci.py ./TacTurn-V1.1-x86-64-v3`.
 
 ## Building from source
 
@@ -134,11 +138,11 @@ flat: `uci.cpp` (UCI harness) plus the `tacturn/` directory (engine core):
 g++ -std=c++17 -O3 -flto -DNDEBUG -march=x86-64-v3 \
     -I. -Itacturn \
     uci.cpp tacturn/*.cpp \
-    -o TacTurn-V1-x86-64-v3 -lpthread
+    -o TacTurn-V1.1-x86-64-v3 -lpthread
 ```
 
 Or simply run `./build.sh` — it builds all three tiers into `bin/` and
-bench-checks each one (every build must print `Total nodes: 188416` for
+bench-checks each one (every build must print `Total nodes: 171520` for
 `bench 9`).
 
 Drop `-march=x86-64-v3` for the universal baseline build, or use

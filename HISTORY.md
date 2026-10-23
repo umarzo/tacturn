@@ -38,6 +38,7 @@ measurement or hard-won lesson is lost.
 | **1.0.0 (V1 production, second clean ship)** | The v1.9.5 (v96b) champion re-versioned as the first stable production release; full campaign-artifact cleanup, removals consolidated here | bench 9 = 281,600 nodes, verify all PASS (see §29) |
 | **1.0.1 (V1 production)** | Elo ceiling 2850 → 3000 with genuinely more compute at the top (all 8 Lazy-SMP threads, 8 s soft budget, Elo-grown TT), in-repo release keystore, portable reference host binary shipped in the zip | startpos fingerprints d9 = 59,904 / d11 = 235,008 nodes — identical to 1.0.0 (see §30) |
 | **1.1.0 (V1.1 production)** | External-review speed & soundness campaign: qsearch SEE-after-make fix, quiet-check prefilter, MVV-LVA + good/bad capture split (early-exit seeGE), NEON VNNI-style kernel, 16-bit histories, multi-cut un-dead-coded, SMP aspiration/best-thread, PGO infrastructure, per-ABI mtune | **+27.9 ± 4.5 Elo vs 1.0.1 (SPRT H1, n=200 @ 100 ms)**; bench 9 = 219,136 nodes x86 == aarch64; all fuzz batteries 0 mismatches (see §31) |
+| **1.4.11 (production)** | Time-management overhaul: the dead hard-wall fix (absolute deadlines), flag-proof clock pacing (overhead reserve, aged moves-to-go, net-increment accounting, proportional floors), forced-move shortcut cut, app-side safety envelope | **vs 1.4.10: +708.3 ± 68.4 @ 1+0 (n=360), +116.0 ± 13.7 @ 2+0.03 (n=500), +33.3 ± 19.9 @ 10+0.1 (n=136)**; flags 100%→0 (1+0), 75%→0 (2+0.03); bench-identical d9 (see §48) |
 
 Note on the version jump to 1.0.0: the production cleanup release was
 deliberately re-versioned to mark the first "clean ship" (versionCode 14,
@@ -425,8 +426,9 @@ time and hands the turn over). Under 15 s the display switches to tenths and
 turns red. A 10 Hz ticker detects flag fall and ends the game properly:
 win on time if the opponent has mating material, otherwise the FIDE 6.9
 safeguard applies (draw — timeout vs insufficient material). The engine's
-search budget is clamped by its own remaining time (soft ≈ remaining/30 + ¾
-increment, hard ≈ remaining/10), so it can never flag itself. Leaving the
+search budget is clamped by its own remaining time (v1.4.11: safety
+reserve + aged moves-to-go pacing + net-increment accounting, see §48),
+so it can never flag itself. Leaving the
 app pauses the clock; returning resumes it. Clock ticks render through a
 dedicated `ClockUiState` flow so 10 Hz updates never re-render the board.
 
@@ -4316,16 +4318,227 @@ gate launched with A=baseline silently inverts the SPRT sign — the
 A/B fields swapped; the pairing design is label-symmetric so the
 evidence chain is exact) before the continuation.
 
+---
+
+## 47. 1.4.10 — the two-signal campaign (continuation corrhist + single-reply extension; +8.6 ± 6.0 @ 100 ms, n=1973)
+
+Campaign shape: a full lever survey against the 1.4.9 tree under the
+2-core/no-hardware constraint, restricted to families the §1–§46 ledger
+leaves genuinely untested. Four candidates were implemented and gated;
+two shipped as a bundle, two were rejected with match data.
+
+Shipped (search.cpp, both in one gate-verified bundle):
+
+- **Continuation correction history** (`corrCont`). The pawn/non-pawn
+  corrhist tables key the eval correction by material placement; the new
+  576 KB/worker table keys it by the OPPONENT'S LAST MOVE (piece-to of
+  stack[ply-1] — the exact key space the continuation ordering histories
+  use). The same structural eval error often depends on what just
+  happened (recapture contexts, fresh outposts, unpriced threats), not
+  only on where pieces sit. Read in corrSumOnly over all own pieces,
+  taught by updateCorr with the same bonus/gravity, POV-clean by the
+  v1.4.7 [stm] keying, never aged (the v1.4.5 persistence regime), and
+  summed at HALF the corr weight (`contSum / (corrWeight * 2)`) — the
+  shipped divisor was tuned for a two-table sum, and folding a third
+  full-amplitude table into it over-corrects (the full-weight variant
+  grew the d9 bench tree +11-23% and lost its gate: -10.5 ± 17.5,
+  n=232). The ply plumbing runs through a corrPly_ member set at every
+  alphaBeta/quiesce entry (the innermost frame owns the continuation
+  context; null-move parents carry MOVE_NONE and skip the key).
+  Individual gate: +4.4 ± 11.4 (n=551 @ 100 ms); NPS-neutral
+  (638 vs 643 kNPS on the d13 bench).
+- **Single-reply extension**. Every legal evasion of a check is a king
+  move, an EP capture, or a move landing on the evasionMask set (the
+  v1.4.4 provably-illegal skip's exact superset); when the pseudo-legal
+  list holds exactly ONE such candidate the reply is forced and keeps
+  its full depth (childDepth = depth). The v2.3 removal note covered
+  UNCONDITIONAL check extension; the single-reply form was never in the
+  ledger. Mutually exclusive with the singular extension by construction
+  (singular is gated on !inCheck), costs one mask pass at in-check
+  nodes, bench d9 −2.4% nodes. Individual gate: +3.3 ± 15.6 (n=317).
+
+The bundle gate (both levers, chained foreground --resume blocks,
+SPRT(0,10), 1 thread, 100 ms/move, 45 openings): **n=1973, W-D-L
+604-814-555, +8.6 ± 6.0, LLR +0.92** — the 95% CI (+2.6 .. +14.6)
+excludes zero. The estimate decayed from an early +22.4 (n=637) to the
+settled +8.6, the familiar first-chunk-spike law (§3.4); every phase of
+the gate and both individual gates read positive (5/5 datasets). Same
+evidence class as the §46 ship (z = 1.43 vs 1.86), with the §28
+TC-dependence law pointing equal-or-larger at the app's 8s/8-thread
+deployment point.
+
+Measured and DROPPED with data:
+
+- **Root LMR** (late quiet root scouts reduced by the LMR table minus
+  one, full-depth verification chain, reduced fail-highs re-scouted
+  before the PVS confirmation): n=870 @ 100 ms, +4.4 ± 9.1, LLR −0.16 —
+  null. The early blocks' +19.9 was opening-pair correlation (5 restart
+  blocks replayed the same 45-pair sequence before a resume-path fix);
+  the fresh-opening segment read −9. REJECTED. Consistent with §42's
+  root-scout-verification parity: the root flow is at a local optimum.
+- **Full-weight continuation corrhist** (contSum / corrWeight): −10.5 ±
+  17.5 (n=232 @ 100 ms), decaying negative — over-correction, as the
+  +11-23% fixed-depth tree growth predicted. REJECTED for the
+  half-weight form.
+- **NNUE blend re-probe / BlendPctEG**: not re-run — the ledger already
+  brackets the optimum on this net (77/72 vs 74/73 = +0.5 ± 12.7, n=743;
+  BlendPctEG 85 = +1.1 ± 11.3, n=950; the 85+Static75 combo +8.3 ± 9.6
+  with the same decay signature). The axis is flat at the optimum in
+  both directions; §37.3's "overnight 1-2 s gate" remains the only way
+  to resolve sub-±5 structure on it.
+- **Net re-train round**: not attempted. No trainer or corpus ships in
+  the repo, and the 2-core/no-GPU host cannot regenerate a 37.7M-position
+  corpus net (§23.3's feasibility verdict and §46's v9.7 triple-negative
+  stand). The lever stays parked for a rig with datagen throughput.
+
+Harness notes: match.py gained --a-opt/--b-opt (arbitrary per-side UCI
+options) and an openings-validation cache; the chained-blocks resume
+path writes/reads the same games/<tag>.json the blocks resume from
+(the first five g1 blocks were lost to a gates/ vs games/ path mismatch
+and are recorded here from their printed FINAL lines). The g1
+opening-repetition episode is itself a datum: replaying one 45-pair
+sequence five times read +19.9 while the fresh-opening continuation
+read −9 — block-level pairing diversity matters at these sample sizes.
+
+Verification: the release build from the integrated tree is
+bench-identical to the gated binary (d9 171,520 / d13 1,363,456);
+perft startpos d4/d5 exact (197,281 / 4,865,609); 1,973 gate games +
+~2,300 screening games with zero engine crashes; the 1.4.9 baseline
+rebuild was bench-identical to the shipped 1.4.9 binary before any edit
+(d9 188,416 / d13 1,150,976).
 
 ---
 
-## V1.1 — host/UCI fix release (core unchanged)
+## 48. 1.4.11 — the time-management overhaul (dead hard-wall fix + flag-proof clock pacing)
 
-`uci.cpp` only; `tacturn/` untouched, `bench 9` = 188,416 on all tiers before and after.
-Tester report (bare exe closed after ~1 s with `FINGERPRINT MISMATCH: expected 33280 nodes at depth 9`) traced to the
-V1 startup self-test: stale 1.3.1 constant (real startpos d9 / contempt 12 / seed 1 = 32,768 nodes) plus exit
-on interactive launch. Removed. Follow-up audit of the host layer found and fixed: searching-flag cleared after
-`bestmove` (dropped next command), lost `stop` before the worker reached `think()` (core clears `stopped_` at
-search start), EOF during `go infinite` hanging, Hash MB→bits rounding up (2x memory), unlimited search on
-negative clock or valueless `go` parameters, unflushed info strings. New `scripts/verify_uci.py` (32 checks)
-passes 32/32 on x86-64 / v3 / v4. See RELEASE-NOTES-V1.md.
+The external rating pass (3157 ± 24, 900 games) came back with one note:
+"TacTurn loses on time very frequently, even in good winning positions."
+This section is the full root-cause record and the fix.
+
+### Root cause 1 (the big one): the hard wall-clock deadline was DEAD CODE
+
+`Worker::runThink` armed the initial deadline correctly (a relative
+`now() + budget`), but every subsequent iteration re-armed it as
+
+    hardDeadline = msToDeadline(startMs + tm->iterationCapMs(depth));
+
+`msToDeadline()` builds a deadline RELATIVE to now; `startMs` is an
+ABSOLUTE `steady_clock`-since-boot epoch timestamp. The re-arm therefore
+produced `now() + uptime + cap` — a deadline one full machine uptime in
+the future. From the second iteration of every clocked search on, the
+hard wall NEVER fired. The only remaining brake was the iteration-start
+pacing, whose cost estimate (`x1.3 last iteration`) is routinely wrong
+by 5-20x in exactly the sharp positions that decide games (aspiration
+fail cascades, sacrifice chains, forcing lines). Measured on a traced
+2+0.03 self-play game: single moves spending 458 ms / 371 ms / 203 ms
+against a 159 ms / 78 ms hard cap — with the engine's OWN internal
+elapsed confirming the search genuinely ran that long. In winning
+positions the game is longest (conversions take moves) and the tactics
+sharpest: precisely where the estimate misses worst and the (dead) wall
+should have caught it. That is the tester's observation, verbatim.
+
+Fix: a `deadlineAt(absMs)` helper (absolute epoch-ms deadline) for every
+re-arm. The wall now actually walls. Bench fingerprint unchanged (the
+deadline never fires in unlimited/fixed-depth bench searches).
+
+### Root cause 2: the clock pacing formula could not survive a long game
+
+The UCI harness mapped `wtime/btime` to `soft = t/25 + 0.75*inc` (flat
+20 ms floor) and `hard = max(t/8, 2*soft)` capped at `t-50` — with the
+`hard >= 2*soft` clamp able to lift the cap ABOVE `t-50` whenever the
+floor pushed `soft` high, and no reserve for the per-move harness
+round-trip overhead (measured on the reference host: median 0.3 ms,
+p99 ~1.2 ms, rare 40+ ms scheduler tails). Consequences:
+
+- **No overhead reserve**: at bullet paces the unbudgeted overhead alone
+  drained the clock move after move (each move costs search + overhead;
+  only 50 ms total was reserved, against `hard` only).
+- **Flat 20 ms soft floor**: below ~150 ms remaining the engine spent
+  more per move than it had — a death spiral.
+- **t/25 with no game-length awareness**: a 60+ move conversion grind
+  starves exactly in the winning endgames.
+- **Increment credited at 0.75x while the overhead consumed it first**:
+  small-increment games were net draining even when "in budget".
+
+Fix (host harness `runGo`, mirroring the app's `engineLimitsFor`):
+Stockfish-style two-reserve accounting —
+  - `safety` (UCI option `MoveOverhead`, default 60 ms, scaled down on
+    tiny clocks): `hard` may NEVER spend into it;
+  - `EXPECTED_OH = 4 ms`: the expected per-move overhead, credited
+    against the increment (`einc = inc - 4`) so the soft budget nets to
+    zero drain whenever the increment covers the true overhead;
+  - a moves-to-go estimate aged through the game (`mtg = 45 - ply/4`,
+    floor 25; emergency thin spread 60 when `t < 500 && inc < t/4`) so
+    geometric decay outpaces the fixed overhead instead of hitting a
+    flat floor;
+  - every cap/floor scales with the remaining clock; `soft <= avail`
+    and `hard <= avail` are invariants (a huge increment can never lift
+    the budget into the reserve — the increment only arrives AFTER the
+    move).
+
+The TimeManager itself took one fix: the pacing floor is now applied
+BEFORE the hard-cap clamp (the old order could lift `paceMs_` above the
+wall on small base budgets). The search's forced-move shortcut was cut
+from 120 ms / full threads to 30 ms / 1 thread — with one legal move the
+search cannot change the choice; the old shortcut burned a forced move's
+whole budget on the clock (sweep + 7 helper spawns included), pure bleed
+in the forcing lines winning endgames are made of.
+
+The app path (`GameViewModel`) carries the same overhaul (safety
+reserve 150 ms for the JNI/settle/animation latency, aged mtg, net
+increment accounting, proportional floors — the old flat
+`MIN_ENGINE_THINK_MS = 60` floor spent money the engine did not have
+under ~200 ms) plus one app-only fix: the cosmetic "thinking" pause is
+now re-capped against the LIVE clock at delay time (the old `/8` cap was
+computed before the search and stacked on top of it — on low clocks the
+search + pause could together spend past the flag).
+
+### Verification
+
+Search semantics are untouched — the release build is bench-identical to
+the shipped 1.4.10 binary (d9 suite: 171,520 nodes, all six positions
+byte-identical), and a 220-game fixed-movetime gate (50 ms) reads
+neutral (as it must: at fixed movetime the wall was always armed
+correctly, and the pacing paths are unchanged).
+
+Clock self-play flag audit (the referee is the harness; a flag is a
+loss), 2-core reference host, 1 thread:
+
+| Engine | 1+0 | 2+0.03 |
+|---|---|---|
+| 1.4.10 | **16/16 flagged** (ply 49-74) | 6/8 flagged (ply 88-145) |
+| 1.4.11 | **0/16** | **0/16** |
+
+Baseline-vs-candidate matches (match.py, 45 paired openings, colors
+swapped per pair, harness-referee clocks, A = shipped 1.4.10 binary,
+B = 1.4.11):
+
+| Time control | n | W-D-L (A) | Candidate gain |
+|---|---|---|---|
+| 1+0 (bullet) | 360 | 5-2-353 | **+708.3 ± 68.4** |
+| 2+0.03 (blitz) | 500 | 101-137-262 | **+116.0 ± 13.7** |
+| 2+0.03, 4 threads | 60 | 9-12-39 | **+190.8 ± 44.4** |
+| 10+0.1 (rapid) | 136 | 24-75-37 | **+33.3 ± 19.9** |
+
+The 1+0 number is what "the engine flags every bullet game" looks like
+when the opponent never does. The rapid-class gain (1.7 sigma,
+under-powered at 136 games) is consistent with the residual causes:
+occasional single-move overruns that the now-live wall absorbs, plus the
+aged moves-to-go pacing that no longer starves long games.
+
+---
+
+## Public repository — V1.1 release (= internal 1.4.11)
+
+The public repo carries the engine core plus the CCRL-ready UCI harness
+(`uci.cpp`). V1.1 = the 1.4.11 core (`search.cpp`, `timeman.h`, `api.cpp`;
+`ttable.h` keeps the Windows-portable allocator) with the harness updated to
+the 1.4.11 flag-proof clock model (new `Move Overhead` option, real
+`movestogo` support kept) and these host fixes found in an audit of the
+protocol layer: searching-flag cleared after `bestmove` (dropped next
+command), lost `stop` before the worker reached `think()`, EOF during
+`go infinite` hanging, Hash MB→bits rounding up (2x memory), unlimited
+search on negative clock / valueless `go` parameters, unflushed info
+strings, and the V1 bare-launch self-test (stale 33,280-node constant) that
+exited immediately on double-click. New `scripts/verify_uci.py` (33 checks)
+passes on x86-64 / v3 / v4. Bench identity: `bench 9` = 171,520.

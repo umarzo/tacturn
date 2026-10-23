@@ -1,51 +1,49 @@
-# TacTurn V1.1 — Release Notes (host/UCI fix release)
+# TacTurn V1.1 — Release Notes
 
-**Released after V1** · Author: **Umar Khan** · License: MIT
+Author: **Umar Khan** · License: MIT · Internal version 1.4.11
+(public V1 = internal 1.4.9; V1.1 = internal 1.4.11).
 
-V1.1 changes **only the UCI host layer (`uci.cpp`)**. The chess core —
-search, evaluation, NNUE, move generation — is untouched and bit-identical:
-`bench 9` = **188,416 nodes** on every tier (all six binaries rebuilt and
-re-checked). Engine ID is unchanged (`id name TacTurn V1`), so rating-list
-entries and strength estimates for V1 carry over. Replace all V1 binaries
-with the V1.1 ones.
+**Replace all V1 files with V1.1.** Binaries are now named
+`TacTurn-V1.1-x86-64[-v3|-v4][.exe]`. `id name` is `TacTurn V1.1`.
+Bench identity changed to **`bench 9` = 171,520 nodes** (V1 was 188,416 —
+the search changed in 1.4.10), identical on all three tiers.
 
-## Fixes
+## Engine changes (from 1.4.10 and 1.4.11)
+
+- **1.4.10 — two search levers:** continuation-history correction and a
+  single-reply extension (+8.6 ± 6.0 Elo @ 100 ms, n=1973).
+- **1.4.11 — clock overhaul:** the hard time wall was dead code in clocked
+  play and the old pacing lost games on time. Rebuilt flag-proof pacing:
+  a `Move Overhead` reserve (default 60 ms), expected-overhead accounting,
+  aged moves-to-go, shrinking depth floor in time trouble, and a pacing
+  floor-vs-cap ordering fix. Self-play at 1+0: previous pacing flagged
+  16/16 games, V1.1 flags 0/16; 2+0.03: 6/8 → 0/16. Head-to-head vs the
+  previous build: +708 (1+0), +116 (2+0.03), +33 (10+0.1) Elo — mostly
+  from no longer flagging. Full data in `HISTORY.md` §48.
+- New UCI option **`Move Overhead`** (ms, default 60, 0–10000). Raise it if
+  your GUI/hardware adds latency.
+
+## Host / UCI fixes (carried over from the V1 → V1.1 audit)
 
 1. **Exe closed ~1 s after launch (double-click / bare console start).**
-   A bare launch ran a startup "fingerprint" self-test and exited. Its
-   expected value was stale (33,280 nodes; the real, correct result is
-   32,768), so it printed `FINGERPRINT MISMATCH` and quit. The self-test is
-   removed; a bare launch now prints a short hint and behaves like any UCI
-   engine, staying open for commands. The real identity check is
-   `bench 9` → `Total nodes: 188416`.
-2. **Dropped command right after `bestmove`.** The "search running" flag
-   was cleared *after* `bestmove` was printed, so a GUI that sent its next
-   `position`/`go` immediately (as fast GUIs do) could have it silently
-   ignored. The flag now drops before `bestmove` is written.
-3. **`stop` right after `go` was lost.** The core clears its stop flag when
-   a search starts, so a `stop` (or `quit`, or GUI crash/EOF) arriving
-   before the worker thread reached the search left it running forever. The
-   host now keeps requesting the stop until the search has actually ended.
-   Closing stdin during `go infinite` also now exits cleanly.
-4. **`Hash` used twice the memory requested** (`Hash 256` allocated
-   512 MB; default 32 → 64 MB). The MB→table-size mapping now rounds down.
-5. **Negative/zero clocks** (`wtime -50`) used to run an unlimited search;
-   they now move immediately. A clock sent for only one side no longer
-   breaks the time budget.
-6. **Malformed `go` parameters** (e.g. a bare `go depth`) no longer zero
-   the limit and turn the search unlimited.
-7. Missing output flushes on `invalid FEN` / `illegal move` messages; no
-   junk `info depth 0` line when a search is stopped before it begins; a
-   printf format warning removed.
+   The old startup self-test used a stale expected value and exited. It is
+   removed; a bare launch now stays open as a normal UCI engine.
+2. **Dropped command right after `bestmove`** (the "searching" flag was
+   cleared too late) — fixed.
+3. **`stop`/`quit`/closed stdin right after `go` could be lost** and leave
+   the search running forever — fixed.
+4. **`Hash` used twice the requested memory** — now rounds down to a power
+   of two (`Hash 256` = 256 MB).
+5. **Negative/zero clock or a bare `go depth`** could run an unlimited
+   search — fixed. Missing flushes and a stray `info depth 0` line fixed.
 
 ## Verification
 
-- `bench 9` = 188,416 on `x86-64`, `x86-64-v3`, `x86-64-v4` (Linux builds).
-- `scripts/verify_uci.py`: **32/32** on all three Linux tiers.
-- Windows `.exe` builds: cross-compiled with MinGW-w64 (static; imports only
-  KERNEL32.dll + msvcrt.dll) from the same source. The Windows files were
-  not executed in the build environment; the double-click fix should be
-  confirmed on a real Windows machine.
+- `bench 9` = 171,520 on `x86-64`, `x86-64-v3`, `x86-64-v4` (Linux builds).
+- `scripts/verify_uci.py`: 33 checks, all passing on all three Linux tiers.
+- Windows `.exe` builds are cross-compiled with MinGW-w64 (static; KERNEL32 +
+  msvcrt only) from the same source. They were not executed in the build
+  environment — confirm on a real Windows machine.
 
 ---
 
