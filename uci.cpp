@@ -563,7 +563,7 @@ int main(int argc, char **argv) {
     // other UCI engine -- keep reading commands until "quit" / EOF.
     // (V1 used to run a startpos "fingerprint" here and exit, which looked
     // like a crash on double-click and tripped on a stale expected value.
-    // The identity check is `bench 9` -> Total nodes: 171520.)
+    // The identity check is `bench 9` -> Total nodes: 180736.)
     if (argc == 1 && isatty(0)) {
         std::fprintf(stderr,
                      "%s by %s -- UCI chess engine (api v%d).\n"

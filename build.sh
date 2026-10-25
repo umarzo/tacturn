@@ -3,7 +3,7 @@
 #   native:  ./build.sh                 -> ./bin/ (Linux)
 #   mingw:   ./build.sh x86_64-w64-mingw32-g++-posix
 #            (Windows exes, statically linked)
-# Bench identity check: every build must print "Total nodes: 171520"
+# Bench identity check: every build must print "Total nodes: 180736"
 # for `bench 9`.
 set -e
 cd "$(dirname "$0")"

@@ -1,4 +1,39 @@
-# TacTurn V1.1 — Release Notes
+# TacTurn V1.1 — Release Notes (current build: internal 1.4.16)
+
+Author: **Umar Khan** · License: MIT. The release stays **V1.1**
+(public V1 = internal 1.4.9; V1.1 = internal 1.4.16, `id name TacTurn V1.1`).
+**Replace all earlier V1 / V1.1 files with these.**
+
+## What is new in this build (on top of everything listed below)
+
+- **Stronger NNUE net: `v99-ftd10-ha-b400`** (internal 1.4.12 → 1.4.16;
+  only the embedded network changed — search, clock manager and UCI layer
+  are unchanged from the earlier V1.1 build):
+  - 1.4.12 anchored-head retrain on a multi-navigator corpus: +81.5 ± 16.8
+    Elo @ 60 ms vs 1.4.11 (SPRT(0,10) H1).
+  - 1.4.13–1.4.14: corpus refreshes with Stockfish-guided exits and a
+    home-anchored head (≈ +10 pooled @ 30/60 ms).
+  - 1.4.15: measured exhaustion of the blend sweep (engine unchanged).
+  - 1.4.16: feature transformer unfrozen + depth-10 teacher labels:
+    +18.0 ± 6.6 @ 30 ms and +32.7 ± 9.7 @ 60 ms vs 1.4.15 (both SPRT(0,10)
+    H1). Full ledger in `HISTORY.md` §49–53.
+- **New bench identity: `bench 9` = 180,736 nodes** (the net changes node
+  counts). Identical on all three tiers, and identical to the author's own
+  1.4.16 build.
+- Default options unchanged: `Hash` 32 MB, `Move Overhead` 60 ms,
+  `NNUEBlend` 77, `StaticBlend` 72.
+
+## Verification
+
+- `bench 9` = 180,736 on `x86-64`, `x86-64-v3`, `x86-64-v4` (Linux builds).
+- `scripts/verify_uci.py`: 33 checks, all passing on all three Linux tiers.
+- Windows `.exe` builds are cross-compiled with MinGW-w64 (static) from the
+  same source; they were not executed in the build environment — confirm on
+  a real Windows machine.
+
+---
+
+# TacTurn V1.1 — earlier build notes (internal 1.4.11, kept for history)
 
 Author: **Umar Khan** · License: MIT · Internal version 1.4.11
 (public V1 = internal 1.4.9; V1.1 = internal 1.4.11).

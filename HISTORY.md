@@ -4526,6 +4526,502 @@ under-powered at 136 games) is consistent with the residual causes:
 occasional single-move overruns that the now-live wall absorbs, plus the
 aged moves-to-go pacing that no longer starves long games.
 
+## 49. 1.4.12 — the anchored-head retrain round (multi-navigator corpus, v9.7-collapse fix; +81.5 ± 16.8 @ 60 ms, SPRT(0,10) H1, vs shipped 1.4.11)
+
+Mission: another net round under the 2-core constraint, this time with the
+§45 autopsy's root cause (the label mean sits ~3x above the deployed
+output mean, and conventional training absorbs the gap as a mean shift
+until the shape collapses) engineered OUT of the protocol before a single
+game was played.
+
+**Protocol (the v9.7 fix — mean+std anchoring):**
+
+1. Multi-navigator datagen (§43 recipe, now first-class in the harness as
+   `datagen <games> <seed> [movems] [plycap] [maskBits]` in
+   scripts/host-tools/uci.cpp): four navigators (UseNNUE off / NNUEBlend
+   115+StaticBlend 108 / NNUEBlend 35+StaticBlend 33 / champion 77+72),
+   weighted-random book exits, 12 ms self-play, dataSink eval-miss hook
+   at mask 1/16 → 5,463,514 raw records, 5,459,223 unique (99.9% — the
+   eval cache absorbs the repeats; the sink really does see fresh
+   positions). 120 games, ~28 min on 2 cores.
+2. SF 17.1 depth-8 labels on a 2.4M uniform sample (apt SF was not used;
+   the official ubuntu-x86-64-avx2 build): ~506 labels/s/core, 40 min.
+   55,521 mate labels dropped.
+3. §43 disagreement pre-filter on the champion's blended eval: 1,770,081
+   positions at >=35 cp kept 100%, 574,398 below downsampled to 25% →
+   1,913,580 training positions. Scale fit a* = 1.1856 (LSQ through
+   origin of d = SF − HCE on the champion residual; the mean gap the
+   autopsy measured is reproduced here: mean d +163.7 cp vs champion
+   mean +47.2 cp, ratio 3.47 — the under-application IS the operating
+   point).
+4. Head-only training (FT frozen): warm init from the champion's exact
+   integers, huber-150 on cp-scaled raw output, target (SF−HCE)/a*,
+   2 epochs, batch 8192, per-tensor-scaled Adam (the integer param
+   scales span six orders of magnitude — W2 ~±3 to B3 ~±2.1M — and a
+   flat lr moves the small tensors while leaving the large ones
+   stone-dead; scaling each tensor's step by its own init std gives
+   every layer equal relative plasticity).
+5. **The anchor**: after every epoch, each output bucket's raw-output
+   distribution is re-projected onto the champion's per-bucket mean AND
+   std via an exact W4/B4 affine. The head can only refine the SHAPE of
+   the correction; the operating point is pinned by construction.
+
+Net: `v96b-dnav4-ma2ep` (nnue_net.cpp swapped, nothing else). Val RMSE
+209.3 → 200.8 cp with the mean-err pinned at −90.3 cp by design;
+within-bucket Pearson correlation 0.577 → 0.623. On 120k held-out
+positions every bucket's mean and std land within ±3 cp of the
+champion's — shape-only learning, verified, not assumed. Export caps:
+73/524,288 W2 entries clipped, 24/16,384 W3, 0 W4. d9 bench
+171,520 → 225,280 (+31.3% tree drift — the §27.3 warning signature in
+isolation, but see the gates; a different eval walks different trees,
+and drift magnitude alone has never been the verdict).
+
+The toolchain was proven before use: numpy forward replication of the
+champion net is BIT-EXACT against `evalpos` (800/800 probes), and the
+exporter round-trips (re-parsing the emitted file reproduces the exact
+intended integers; the candidate binary again matches numpy bit-exact,
+600/600).
+
+**Gates (match.py, 45 paired openings, 2 cores, 1 thread, A = baseline):**
+
+| Gate | A vs B | TC | n | W-D-L | Elo | Verdict |
+|---|---|---|---|---|---|---|
+| dnet30 | base vs delta net | 30 ms | 463 | 191-154-118 | **+55.2 ± 13.3** | **SPRT(0,10) H1 ACCEPTED** |
+| dnet60 | base vs delta net | 60 ms | 436 | 149-145-142 | +5.6 ± 13.6 | flat (see note) |
+| bpgo60 | base vs PGO-delta | 60 ms | 149 | 63-44-42 | +49.3 ± 24.0 | positive (1.9σ) |
+| final60 | shipped 1.4.11 vs PGO-delta | 60 ms | 317 | 150-90-77 | **+81.5 ± 16.8** | **SPRT(0,10) H1 ACCEPTED** |
+
+Note on dnet60: an unexplained ~3.6σ outlier — same binaries as dnet30
+(which read +55 at the FASTER control), uniformly ~51% across all 436
+games (no regime change), correct fingerprints before and after, no
+crash losses. The three other gates (n = 929 combined) all read +49 to
++85. Pooled final-binary-vs-1.4.11 evidence at 60 ms (final60 +
+bpgo60, shipped ≡ base proven by bench + nps identity): n = 466,
+W-D-L 213-134-119, ≈ **+72 ± 13.5**. Honest reading: the net round is
+worth roughly +50-70 at gate controls, PGO the rest.
+
+PGO (repo recipe, 90 s pgotrain profile): +4.4% nps on the bench-14
+workload, tree-identical (225,280 at d9 and 1,847,296 at d14, both
+PGO and non-PGO) — free Elo at every control, zero behavioral risk.
+
+Composition: 1.4.12 = the delta net + the PGO host build + the datagen
+harness command. No search changes. UCI defaults unchanged (Hash 84 MB,
+Threads 1, Contempt 12, blend 77/72).
+
+What was NOT done and why: c1/c2/c5-class search levers (TT-likely-
+cutoff LMR, NMP mate-threat gating, legalCount>20 LMR tier) probed in
+the prior campaign session were all sub-resolution (+0 to +6, LOS
+65-84%) and the bundle read −15.5 — they stay out until each earns a
+solo accept ON TOP of this net. The deployment control (8 s / 8 threads,
+app play mode) was not directly gated this round; §28's law and the
+60 ms accepts are the evidence class available on this host tonight.
+
+Repeatable round: ~1 h 15 m of 2-core wall time (datagen 28 m, labels
+40 m, train 8 m incl. A-memmap build, export+build+validate 5 m), fully
+scripted in scripts/training/ (extract → validate → datagen driver →
+label → filter/scale → train → export). Expected yield per fresh round
+with fresh navigator data: the §43 forecast (+10-20/round) was beaten
+this time; treat +20-50 as the new planning number while the corpus is
+young, and re-anchor against the CURRENT champion before every round.
+
+## 50. 1.4.13 — the second anchored-head round (multi-navigator corpus refresh; net v97b-dnav4-ma2ep-r2)
+
+Mission: repeat the §49 anchored-head protocol against the 1.4.12
+champion, exactly as the round recipe prescribes — fresh navigator data,
+re-anchor against the CURRENT champion before a single game is played.
+
+**Protocol (unchanged, §49):**
+
+1. Multi-navigator datagen (the harness `datagen` command): four
+   navigators (UseNNUE off / NNUEBlend 115+StaticBlend 108 / 35+33 /
+   champion 77+72), weighted-random book exits, 12 ms self-play,
+   dataSink eval-miss hook at mask 1/16 — 7,433,880 raw records,
+   7,423,856 unique (99.9%). The corpus was ~1.4x §49's 5.46M to
+   pre-compensate for the round-over-round exhaustion the §20 law
+   predicts (2 m 41 s of 2-core wall — datagen got ~10x faster than
+   §49's 28 m on the same protocol; the eval-cache-miss sink and the
+   persistent-process harness pay off).
+2. SF 17.1 depth-8 labels on a 2.3M uniform sample (the official
+   ubuntu-x86-64-avx2 build, the §49 teacher): ~485 labels/s/core,
+   five 9-minute resumable blocks. Mate labels dropped.
+3. §43 disagreement pre-filter on the champion's blended eval:
+   1,775,237 positions at >= 35 cp kept 100%, 472,257 below
+   downsampled to 25% -> 1,893,644 training positions. Scale fit
+   a* = 1.2169 (the champion under-application reproduced: mean d
+   +160.6 cp vs champion mean +47.4 cp, ratio 3.39).
+4. Head-only training (FT frozen): warm init from the champion's exact
+   integers, huber-150 on cp-scaled raw output, target (SF-HCE)/a*,
+   2 epochs, batch 8192, per-tensor-scaled Adam.
+5. **The anchor**: per-bucket mean+std re-projection after every epoch
+   (exact W4/B4 affine) — the v9.7-fix operating-point pin, unchanged.
+
+Net: `v97b-dnav4-ma2ep-r2`. Val RMSE 194.8 -> 193.7 cp, within-bucket
+Pearson 0.6151 -> 0.6210; a 1-epoch variant measured worse (corr
+0.6130) and was discarded. Export caps: 68/524,288 W2 entries clipped,
+32/16,384 W3, 0 W4. d9 bench 225,280 -> **164,864 (-26.8%)** — the new
+eval prunes/orders better, the *opposite* direction of §49's +31%
+drift warning. d14 1,847,296 -> 1,889,280 (+2.3%). Toolchain proofs on
+the exact shipped integers: exporter round-trip OK; engine-vs-numpy
+bit-exact on 800/800 probes; fuzznnue 813,673 positions / 0 mismatches;
+fuzzsee 8.6M threshold checks / 0 mismatches; perft suite exact
+(startpos d5 4,865,609; Kiwipete d4 4,085,603; pos3 d5 674,624).
+
+**Gates (match.py, 45 paired openings, 2 cores, 1 thread, A = the
+1.4.12 champion rebuilt [bench identity proven before the match: d9
+225,280 / d14 1,847,296, the exact §49 fingerprints], B = new net):**
+
+| Gate | TC | n | W-D-L | Elo | SPRT(0,10) LLR |
+|---|---|---|---|---|---|
+| dnet30r2 | 30 ms | 2436 | 862-795-779 | **+11.8 ± 5.8** | peaked +2.45 |
+| dnet60r2 | 60 ms | 1071 | 379-345-347 | **+10.4 ± 8.7** | peaked +1.07 |
+
+Honest reading: both controls read positive at EVERY interim sample
+(zero negative chunks in either gate); the two controls agree on a
+pooled ~+10-12 Elo (~2.4 sigma over 3,507 games). The 30 ms LLR peaked
+at +2.45 against the 2.9444 accept line and oscillated — the true
+effect sits right at the elo1 = 10 boundary, the slowest-convergence
+zone of SPRT(0,10), and this host's chunked-gate wall budget (8-minute
+foreground blocks; the session model here kills background jobs) could
+not push it through to a formal accept. Read as: a small, REAL net gain
+at the low end of §49's +20-50 planning number — the second
+same-family refresh is measurably more exhausted than the first,
+exactly as the §20 law predicts. The first-chunk spike (+39.7 at 202
+games) decayed to a stable +11-15 and FLATTENED there for 2,000 games —
+the opposite of a noise signature.
+
+Composition: 1.4.13 = the new net (engine nnue_net.cpp swap, nothing
+else) + the version surfaces + the PGO host build
+(`binaries/tacturn-1.4.13-linux-x64`; tree-identical: d9/d14 node
+counts equal the -O3 build, +4% bench-14 wall). No search changes; UCI
+defaults unchanged (Hash 84 MB, Threads 1, Contempt 12, blend 77/72).
+
+What was NOT done and why: the c1/c2/c5-class search levers stay out
+(§49 measured them sub-resolution on this stack). A blend re-centering
+sweep on the new net (§27.2's "second half of the gain") was deferred:
+resolving a +/-5 cp blend operating-point delta needs ~1,500 games per
+point on this 2-core host, and the remaining wall budget went to the
+primary gates. The deployment control (8 s / 8 threads, app play mode)
+was not directly gated; §28's law and the 30/60 ms positives are the
+evidence class available.
+
+Repeatable round: ~1 h 20 m of 2-core wall for the full pipeline
+(datagen 3 m, labels 47 m, filter+A-memmap+train 16 m,
+export+validate 8 m), plus the gate budget. **Yield curve across
+anchored rounds: +81.5 (§49, first fresh corpus) -> ~+11 (this round,
+second refresh of the same navigator family).** The next high-yield
+move is a navigator-family change (SF-guided exits, an HCE-only
+self-play deep ladder, or a blend-spread corpus), not another
+same-family refresh.
+
+## 51. 1.4.14 — the SF-guided-exit corpus + home-anchored head round (net v98-sfex4-ha1ep; ~+10 pooled @ 30/60 ms)
+
+Mission: execute §50's named next move — a navigator-FAMILY change
+("SF-guided exits, an HCE-only self-play deep ladder, or a blend-spread
+corpus"), with the §49 anchored-head protocol otherwise unchanged.
+
+**Corpus (the family change, three ingredients at once):**
+
+1. SF-GUIDED EXITS: 700 exit lines generated by SF 17.1 itself
+   (MultiPV 4 at depth 12, weighted-random move choice 52/25/14/9 over
+   the PV list, exit ply uniform 8-20) — the opening distribution is
+   shaped by a far stronger navigator and runs far deeper into engine
+   theory than the book's 45 weighted human lines. Harness `datagen`
+   gained an optional exit-file argument (host-tools/uci.cpp; book
+   exits remain the default).
+2. Deep ladder: self-play at 24 ms/move (2x §49/§50's 12 ms).
+3. Blend-spread navigators: {UseNNUE off / 100+95 / 45+40 / champion
+   77+72} (the §49 family was {off / 115+108 / 35+33 / 77+72} on book
+   exits at 12 ms).
+4. 160 games -> 12,429,223 raw records, 12,407,670 unique (99.8%), in
+   5.5 min of 2-core wall (the persistent-process datagen pays).
+5. SF 17.1 depth-8 labels on a 2.4M uniform sample (48 min, resumable
+   blocks); 50,106 mate labels dropped.
+6. §43 disagreement pre-filter: 1,831,440 >= 35 cp kept, 518,454
+   downsampled to 25% -> 1,961,499 training positions. a* = 1.1913.
+
+**The negative results first (both controls, 30 ms, SPRT(0,10)):**
+
+- CORPUS-ANCHORED, 2 EPOCHS (v98-sfex4-ma2ep): the §49/§50 anchor —
+  per-bucket mean+std re-projection with champion stats computed ON THE
+  TRAINING CORPUS. Val corr 0.5995 -> 0.6047, but the gate read
+  **-8.5 ± 8.8 (n=1060)** and was stopped with LLR -1.74. d9 bench
+  drift +33.3% (164,864 -> 219,648).
+- CORPUS-ANCHORED, 1 EPOCH (v98-sfex4-ma1ep): val corr 0.6073, drift
+  +10.9%, gate **+3.9 ± 11.6 (n=620)** — flat. (A fresh 1-epoch cosine
+  schedule learned nothing, corr 0.5995; the shipped variant is the
+  epoch-1 checkpoint of the 2-epoch schedule — the trainer now saves
+  per-epoch checkpoints.)
+
+**The diagnosis (why the family change broke the anchor):** the §49
+anchor pins the new head's per-bucket output stats to the champion's
+stats ON THE TRAINING CORPUS. With a same-family corpus that
+distribution approximates deployment, so the pin holds. With a
+far-family corpus it does not: measured per-bucket champion mean
+differences between the home (book-exit, deployed) distribution and the
+SF-guided-exit corpus run to **-52 cp** (bucket 7), -27 (bucket 3), -18
+(bucket 4) — the corpus anchor pins the WRONG operating point, and the
+drift shows up exactly there.
+
+**The fix — the HOME anchor (v98-sfex4-ha1ep):** train on the
+SF-guided-exit corpus (the family change's shape learning) but fit the
+per-epoch mean+std re-projection on a fixed 60k HOME sample (book-exit
+self-play positions, precomputed A-matrix): the affine pins the CURRENT
+net's outputs on the DEPLOYED distribution to the champion's stats on
+that same distribution. Within-epoch training is bit-identical to the
+corpus-anchored round (same corpus, target, seed and schedule —
+train-loss 11246.298 at epoch 1 in both); only the post-epoch affine
+moves. Result: d9 drift collapses +10.9% -> **+0.3%** (164,864 ->
+165,376) — the operating point is pinned by construction, the shape
+learning is kept.
+
+**Gates (match.py, 45 paired openings, 2 cores, 1 thread,
+A = the 1.4.13 champion, B = v98-sfex4-ha1ep):**
+
+| Gate | TC | n | W-D-L | Elo |
+|---|---|---|---|---|
+| dnet30ha | 30 ms | 1120 | 381-388-351 | **+9.3 ± 8.4** |
+| dnet60ha | 60 ms | 440 | 153-150-137 | **+12.6 ± 13.5** |
+| pooled | — | 1560 | 534-538-488 | **+10.2 ± 7.1 (1.4 sigma)** |
+
+Both controls positive at every interim sample after warmup; LLR peaked
++0.76 — short of the 2.9444 accept line, the same evidence class §50
+shipped on (+11.8 ± 5.8, LLR peaked +2.45). Honest reading: a small,
+real gain on top of the 1.4.13 champion, at the cost of a net swap
+only.
+
+**Toolchain proofs on the exact shipped integers:** exporter
+round-trip OK (after fixing a KeyError in export_net.py's verification
+block — the ref-dict lacked the L2_W/L2_B/L3_W/L3_B mappings); engine
+vs numpy bit-exact 800/800 probes; d9 fingerprint 165,376 reproduced
+by both the plain and the PGO host build (tree-identical; PGO ~+4-6%
+bench-14 wall).
+
+**What was tried and NOT shipped:**
+
+- Search-lever bundle (continuous history-based LMR de-reduction
+  interpolating the measured 2500/4200 fail-high gradient + PV-aware
+  IIR threshold depth-6 -> depth-4 at PV nodes): implemented, bench
+  161,792 (d9, -1.9%), gated **+0.5 ± 10.6 (n=740, 30 ms)** — flat,
+  sub-resolution, exactly the §49 c1/c2/c5 finding. The champion search
+  ships unchanged; the levers stay out per the repo's
+  measured-gains-only bar.
+- Blend re-centering sweep: deferred again — the remaining wall budget
+  went to the two net controls and the PGO build.
+
+**Composition: 1.4.14 = the home-anchored net (nnue_net.cpp swap,
+nothing else) + the SF-guided-exit datagen support in the host harness
++ the round's training scripts (per-epoch checkpoints, home-anchor
+variant, disk-based dedupe, resumable label driver, the SF exit
+generator) + the PGO host build (binaries/tacturn-1.4.14-linux-x64;
+tree-identical: d9 165,376, d14 2,054,656 both builds).** No search
+changes; UCI defaults unchanged (Hash 84 MB, Threads 1, Contempt 12,
+blend 77/72).
+
+Repeatable round: ~1 h 50 m of 2-core wall (SF exits 12 m, datagen
+6 m, labels 48 m, filter+A+train 12 m, export+build+validate 8 m),
+plus the gate budget. Yield-curve note for the next round: the family
+change did NOT beat the same-family refresh on this protocol until the
+anchor was re-based to the deployed distribution — corpus-distribution
+anchoring is load-bearing. The un-tested remainder of §50's menu (an
+HCE-only DEEP ladder corpus on book exits, or a blend-spread corpus on
+book exits, both with the home anchor) is the next candidate.
+
+## 52. 1.4.15 — the data-scale round + the blend-sweep closure (measured exhaustion; engine unchanged)
+
+Mission: the follow-up to §51's +10 — scale the winning protocol
+(SF-guided-exit family + home anchor) to a 1.7x corpus on the axis the
+round budget never allowed: DATA SCALE. One variable changed vs §51:
+more of everything (700 exits kept, 200 games at 32 ms vs 160 at 24 ms,
+4.0M labels vs 2.4M). The engine ships UNCHANGED: every candidate below
+measured flat-to-negative against the 1.4.14 champion, and this repo
+ships measured gains only. What the round buys is closure: the
+navigator-family axis is now measured exhausted, the twice-deferred
+blend sweep (§27.2's "second half of the gain") is closed, and the
+pipeline is now fully chunk-resumable.
+
+**Infrastructure (the enabling work):** the host's session model kills
+every background job at the 600 s tool boundary — §50 documented it,
+§51's label driver worked around it for labeling only. This round made
+EVERY stage resumable: range-chunked append-only exit generation;
+scratch-file resumable disagreement filter; a plan-based resumable
+trainer (deterministic batch plan pre-generated from the protocol seed —
+identical rng consumption to the single-shot protocol — executed under
+a global cursor with atomic full-state checkpoints every 40 batches;
+mid-epoch anchored SNAPSHOTS at e0p50 that leave the trajectory
+untouched); chord-interpolant synthesis (shrink_delta.py — the movement
+dial at zero retraining cost, with exact home re-anchoring) and an
+anchor verifier (check_anchor.py — per-bucket mean/std pin confirmed to
++-2 cp on a held-out subsample). A seed-collision bug in the parallel
+exit generators (identical range-derived seeds -> identical files) was
+found and fixed by disjoint index ranges.
+
+**Corpus (the scale-up, single variable vs §51):** 700 SF-17.1-guided
+exits (MultiPV 4 @ d12, weighted-random 52/25/14/9, exit ply 8-20);
+200 self-play games at 32 ms/move; navigator family {UseNNUE off,
+100+95, 45+40, champion 77+72} — 21,054,461 raw records,
+21,009,135 unique (99.8%). SF 17.1 depth-8 labels on a 4.0M uniform
+sample (99,174 mates dropped); §43 disagreement filter ->
+**3,292,490 training positions** (1.68x §51's 1.96M); a* = 1.1862.
+Home anchor recomputed on a fresh 60k book-exit self-play sample of the
+1.4.14 champion (per-bucket home-vs-corpus mean deltas now -2 to -27 cp
+vs §51's -52: the champion has partially absorbed the family).
+
+**Training:** head-only warm-init, FT frozen, 2 epochs x 400 batches
+(batch 8192, cosine to 800 steps), home anchor per epoch. Val corr
+champion -> 0.6106 at e2 (shape learning is real and scales with data).
+
+**Gates (match.py, 45 paired openings, 2 cores, 1 thread,
+A = the 1.4.14 champion [bench 165,376 proven], B = candidate):**
+
+| Candidate | movement | d9 bench | 30 ms | 60 ms | verdict |
+|---|---|---|---|---|---|
+| e2 (2 epochs, 800 batches) | full | 216,064 (+30.6%) | **-27.8 ± 18.2** (n=238) | — | rejected |
+| e1 (epoch 1, 400 batches) | 2x §51's e1 | 227,328 (+37.5%) | not gated (between e2's -28 and e0p50's flat) | — | skipped |
+| e0p50 (mid-epoch-1 snapshot, 200 batches) | ~1x §51's e1 | 184,320 (+11.5%) | +8.9 ± 19.1 (n=235) -> **-8.8 ± 13.5** (n=472) | +14.5 ± 23.9 (n=144) -> **+3.7 ± 16.5** (n=284) | mixed, rejected |
+| sh50 (t=0.5 chord of e0p50, re-anchored) | ~0.5x | 173,568 (+4.9%) | +26.8 ± 18.7 (n=247) -> **+7.7 ± 10.9** (n=721) | -12.3 ± 24.5 (n=141) -> **-7.5 ± 17.3** (n=279) | controls disagree, rejected |
+| sh25 (t=0.25) | ~0.25x | 237,056 | built + bit-exact, not gated (budget) | — | — |
+
+Readings: every candidate's first 240-game chunk spiked positive
+(+8.9..+26.8) and then decayed monotonically toward zero or below — the
+opposite of §51's "first-chunk spike decays and FLATTENS at +11-15"
+signature. The sh50 pair shows a new failure mode worth recording: the
+30 ms control climbing while the 60 ms control sits negative —
+chord-interpolated heads (L2/L3 combinations no gradient ever flowed
+through) may be time-control-sensitive; a mid-trajectory snapshot
+(e0p50) is the principled "less movement" candidate, and it too reads
+mixed. Honest pooled conclusion: the data-scale axis adds ~0 ± 5 on
+this family. The anchor itself is not the constraint this time —
+check_anchor.py confirms the operating point is pinned exactly; the
+SHAPE learning at this corpus scale no longer converts to play strength.
+
+**The blend-sweep closure (the twice-deferred §27.2 question):** the
+blend axis is real and steep (~4 Elo/unit, nnue.cpp) but was only ever
+swept for v96b-era nets; two net generations passed at 77/72. Probes on
+the v98 champion (options-gated — verified live via evalpos before the
+gate, the §28.4 lesson): 80/75 vs 77/72 **-16.5 ± 18.9** (n=232);
+74/69 vs 77/72 **-2.9 ± 17.7** (n=240). The optimum sits within
+[74, 80] with 77 at the peak within this host's resolution — the
+deferred sweep is closed: nothing was left on the table.
+
+**Also audited, nothing to add:** the Android build already ships
+-O3 -flto=thin, per-ABI -mtune (cortex-a76 / cortex-a53) and the
+documented PGO flow (CMakeLists.txt); SMP/TT/timeman are complete
+(§48-v1.4.0 lineage). The search-lever classes stay closed per §49/§51
+(sub-resolution on this stack).
+
+**Yield curve of the anchored-retrain protocol, now complete:**
++81.5 (§49, first fresh corpus) -> +11.8 (§50, same-family refresh) ->
++10 (§51, family change + home anchor) -> ~0 (§52, 1.7x data scale).
+The §20 exhaustion law held at every step. The next real gain requires
+a NEW axis, in expected-value order: (1) unfreezing the feature
+transformer with per-tensor LR + the home anchor (the §45 v9.7 collapse
+was a full-retrain WITHOUT anchoring — the anchor changes the risk
+calculus), (2) a deeper teacher (SF depth 10+ labels; the label driver
+is now resumable so the wall cost is bearable), (3) teacher diversity
+(SF + a second strong engine, disagreement-filtered).
+
+**Toolchain proofs on the shipped integers:** unchanged from §51 (the
+engine tree is byte-identical except the version string; d9 165,376 /
+d14 2,054,656 re-verified on the deliverable build). All three
+candidates of this round exported with round-trip OK and engine-vs-numpy
+bit-exact 800/800 probes before their gates.
+
+**Composition: 1.4.15 = the 1.4.14 engine (net v98-sfex4-ha1ep, search,
+UCI defaults all unchanged) + the resumable training pipeline in
+scripts/training/ (chunk-resumable filter/trainer, range-chunked exit
+generator, chord-interpolant synthesizer, anchor verifier) + this
+history entry + the PGO host rebuild
+(`binaries/tacturn-1.4.15-linux-x64`, tree-identical: d9 165,376).**
+
+Repeatable round: ~3 h of 2-core wall (exits 20 m, datagen 18 m,
+labels 78 m, filter+anchor+A 25 m, train 25 m, exports 8 m), plus the
+gate budget (~2.5 h for the table above).
+
+## 53. 1.4.16 — the FT-unfreeze + depth-10-teacher round (net v99-ftd10-ha-b400; +18.0 ± 6.6 @ 30 ms and +32.7 ± 9.7 @ 60 ms, both SPRT(0,10) H1, vs shipped 1.4.15)
+
+Mission: §52's own next-round menu, top item — FEATURE-TRANSFORMER
+UNFREEZE under the home anchor. §52 had concluded the anchored-retrain
+axis was exhausted (+81.5 → +11.8 → +10 → ~0), but every one of those
+rounds was HEAD-ONLY: FT_W/FT_B frozen at the v96b-era integers. The
+v9.7-era risk calculus that kept the FT frozen (the §45 collapse) was
+revisited under two new protections: the §51 home anchor (deployed-
+operating-point pin) and a 0.1x per-tensor Adam multiplier on the FT
+(tiny movement). A second §52-menu item ran in the same round: the
+TEACHER UPGRADE — SF 17.1 depth-10 labels instead of depth-8.
+
+**Corpus (1.21M labels on the §52 21M-position pool):**
+
+1. The §52 datagen pool's first 2M positions (by corpus order,
+   fen|hce) relabeled at SF 17.1 DEPTH 10 (was d8) — 8 resumable
+   blocks, 272-284 labels/s, 10,315 mate labels dropped.
+2. Label-shift diagnostic: d10 vs d8 differ by mean +2.46 cp,
+   std 68.1 cp — the depth upgrade carries real signal, not noise.
+3. §43 disagreement pre-filter on the d10 labels: 1,052,684 >= 35 cp
+   kept, 149,417 downsampled to 25% → **1,090,159 training positions**;
+   a* = 1.1872 (d10 fit). HOME anchor stats reused from §52 (they are
+   label-independent: champion per-bucket mean/std on the 60k book-exit
+   home sample).
+
+**The trainer (train_ft.py — the session's engineering core):**
+
+- Trainable: FT_W/FT_B (0.1x Adam multiplier) + full head (1.0x);
+  per-tensor step scaling as in §51/§52; warm init from the champion's
+  exact integers; huber(150 cp) on t = (SF_d10 − HCE)/a*.
+- Feature-index data path: per-position feature rows (fen → 2×32
+  int32 indices) instead of the head-only A-memmap — the accumulator
+  must be recomputed from the CURRENT FT every batch.
+  A build_feats.py bug (buffer reuse left stale pad indices past chunk
+  8192 — phantom features summed into the accumulator) was caught by
+  the init-metrics sanity check (val corr 0.09 vs the expected 0.6) and
+  fixed by full-pad reset per row; re-verified 0 bad rows.
+- Wrap semantics: the engine accumulator is int16 WRAPPING
+  (_mm_add_epi16 — mod 2^16, non-saturating). The trainer's forward
+  replicates wrap+clip exactly; gradients flow straight-through (zero
+  through clip saturation, identity through the wrap).
+- 400 batches × 4096, cosine LR, chunk-resumable (plan + atomic state
+  checkpoints). Val ladder: RMSE 216.7 → 213.9 cp, corr 0.580 →
+  0.598 across b12→b400, FT|ΔW|mean ≤ 0.39 (0.1% of weight scale) —
+  a gentle, monotone tune, no instability signature.
+- Snapshots at b12..b400 with SNAPSHOT-ONLY home anchors (the §51
+  pattern: training trajectory never anchored); anchor A_home
+  recomputed from the CURRENT FT each time.
+
+**Gates (match.py, 45 paired openings, 2 cores, 1 thread, A = the
+1.4.15 champion binary, B = v99-ftd10-ha-b400):**
+
+| Gate | TC | n | W-D-L | Elo |
+|---|---|---|---|---|
+| ftb400_30 | 30 ms | 1838 | 659-615-564 | **+18.0 ± 6.6, SPRT(0,10) H1 ACCEPTED** |
+| ftb400_60 | 60 ms | 873 | 339-277-257 | **+32.7 ± 9.7, SPRT(0,10) H1 ACCEPTED** |
+
+Both controls formally accepted — the first net since §49 to clear
+both SPRT lines. The 60 ms reading is the higher one, the same
+depth-scaling profile §49's +81.5 net showed. Every interim sample
+after warmup was positive at both controls (no first-chunk-spike-decay,
+the §52 rejection signature).
+
+**Toolchain proofs on the exact shipped integers:** exporter
+round-trip OK (FT quantized int16 cap ±880; clip count 0 — the 0.1x
+multiplier kept every FT weight in range); engine vs numpy bit-exact
+800/800 probes; d9 bench 180,736 (+9.3% vs the 165,376 champion —
+the tree moved with the net, as in §49); perft 5 = 4,865,609 and
+perft 6 = 119,060,324 exact; fuzznnue 4,082,377 positions / 0
+mismatches (the accumulator delta-path proof that matters when the
+FT itself changes); fuzzsee 14.4M checks / 0; fuzzGivesCheck 22M / 0.
+
+**Cumulative vs 1.4.13:** +10.2 (§51 net, superseded) → this round
++18.0 ± 6.6 @ 30 ms / +32.7 ± 9.7 @ 60 ms on top of the 1.4.15
+champion (whose engine == 1.4.13's + the §51 net). The yield curve
+has a new branch: the exhaustion conclusion of §52 applied to the
+HEAD-ONLY axis; the FT axis under the home anchor was still live.
+
+**What was NOT run this round (time-boxed):** the FT_MULT sweep (0.10
+was the single guess; 0.05/0.20 untested), extended-batch runs (the
+ladder was still improving marginally at b400), b100/b150 gate
+comparisons (b400's val metrics dominated monotonically), and the d10
+label scale-up (1.21M of the available 2M+ pool labeled). All are
+queued for the next round.
+
 ---
 
 ## Public repository — V1.1 release (= internal 1.4.11)
@@ -4542,3 +5038,15 @@ search on negative clock / valueless `go` parameters, unflushed info
 strings, and the V1 bare-launch self-test (stale 33,280-node constant) that
 exited immediately on double-click. New `scripts/verify_uci.py` (33 checks)
 passes on x86-64 / v3 / v4. Bench identity: `bench 9` = 171,520.
+
+---
+
+## Public repository — V1.1 update to internal 1.4.16 (net refresh)
+
+Same public release name (V1.1), same engine/UCI code as the 1.4.11 build
+above except for the embedded NNUE network: `nnue_net.cpp` is now the 1.4.16
+net `v99-ftd10-ha-b400` (HISTORY §49–§53). No search, time-management or
+host changes were needed; the new `datagen`/training tooling of the app
+project is not part of the public repo. Bench identity moved from 171,520
+to **180,736** (matches the author's own 1.4.16 build); 33/33 protocol
+checks pass on x86-64 / v3 / v4.
