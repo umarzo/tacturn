@@ -31,7 +31,7 @@ path = sys.argv[1]
 e = Eng(path)
 e.send("uci"); out, ok = e.until(lambda l: l == "uciok", 10)
 t = "\n".join(out)
-check("id name is 'TacTurn V1.1'", "id name TacTurn V1.1" in out)
+check("id name is 'TacTurn V1.2'", "id name TacTurn V1.2" in out)
 check("id author present", any(l.startswith("id author ") for l in out))
 check("Hash option 1..32768 MB", "option name Hash type spin default 32 min 1 max 32768" in out)
 check("Move Overhead option", any("name Move Overhead type spin default 60" in l for l in out))
