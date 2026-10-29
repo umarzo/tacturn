@@ -1,9 +1,9 @@
 #!/bin/bash
-# TacTurn V1.1 — reproducible release build (all 3 ISA tiers).
+# TacTurn V1.2 — reproducible release build (all 3 ISA tiers).
 #   native:  ./build.sh                 -> ./bin/ (Linux)
 #   mingw:   ./build.sh x86_64-w64-mingw32-g++-posix
 #            (Windows exes, statically linked)
-# Bench identity check: every build must print "Total nodes: 180736"
+# Bench identity check: every build must print "Total nodes: 230912"
 # for `bench 9`.
 set -e
 cd "$(dirname "$0")"
@@ -14,7 +14,7 @@ WIN=0
 case "$CXX" in *mingw*) WIN=1 ;; esac
 
 for TIER in x86-64 x86-64-v3 x86-64-v4; do
-  OUT="bin/TacTurn-V1.1-$TIER"
+  OUT="bin/TacTurn-V1.2-$TIER"
   FLAGS="-std=c++17 -O3 -flto -DNDEBUG -march=$TIER"
   if [ "$WIN" = 1 ]; then
     OUT="$OUT.exe"

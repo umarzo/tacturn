@@ -5022,6 +5022,370 @@ comparisons (b400's val metrics dominated monotonically), and the d10
 label scale-up (1.21M of the available 2M+ pool labeled). All are
 queued for the next round.
 
+## 54. 1.4.17 — the extended-batch + label-scale round (net v100-ftd10-ha-b600; +7.4 ± 5.9 @ 30 ms, +8.7 ± 10.4 @ 60 ms, pooled +7.7 ± 5.2, LLR +1.00, vs shipped 1.4.16)
+
+Mission: execute §53's own queued menu — BOTH queued axes in one round:
+the EXTENDED-BATCH run (b400 -> b800; the val ladder was still improving
+at b400) and the D10 LABEL SCALE-UP (1.09M -> 1.49M training positions).
+The protocol is otherwise §53's exactly: FT-unfreeze (0.1x Adam mult)
+under the home anchor, warm init from the v99 champion, SF 17.1 depth-10
+teacher, navigator family {off, 100+95, 45+40, 77+72} on SF-guided exits.
+
+**Corpus (1.49M positions, 1.37x §53):**
+
+1. 700 fresh SF-17.1-guided exits (MultiPV 4 @ d12, weighted 52/25/14/9,
+   exit ply 8-20; range-chunked, per-range seeds).
+2. 4-navigator datagen, 200 games at 24 ms/move: 16,501,746 raw records
+   -> 16,464,235 unique (disk dedupe).
+3. Uniform 1.8M labeling sample; SF 17.1 d10 labels (2 workers, 273/s;
+   10,315-equivalent mate drop = 57,280) -> 1,742,720 cp labels.
+4. §43 disagreement pre-filter -> **1,494,811 training positions**;
+   a* = 1.1609. HOME anchor stats from a fresh 60k book-exit self-play
+   sample of the 1.4.16 champion (v99) — per-bucket home-vs-corpus
+   champion mean deltas -1.5 to -19.5 cp (the v99 champion has further
+   absorbed the family; the anchor pins the deployed operating point).
+
+**Training (train_ft.py, schedule extended b400 -> b800):** warm init
+from the v99 champion integers; FT_W/FT_B at 0.1x Adam mult + full head
+1.0x; huber(150) on t = (SF_d10 - HCE)/a*; wrap-exact int16 forward;
+snapshot-only home anchors at b12..b800. Val ladder: RMSE 188.3 -> 184.1,
+corr 0.5901 -> 0.6086 (b600) -> 0.6086 (b800, plateau); FT|dW|mean 0.64.
+
+**Gates (match.py, 45 paired openings, 2 cores, 1 thread,
+A = the 1.4.16 champion binary [bench 180,736 proven], B = candidate):**
+
+| Gate | TC | n | W-D-L | Elo |
+|---|---|---|---|---|
+| ftb800_30 | 30 ms | 260 | 82-83-95 | **-17.4 ± 17.8** — rejected, the extension OVERTRAINS |
+| ftb400_30 | 30 ms | 260 | 103-63-94 | +12.0 ± 18.8 (one sample) |
+| ftb400_60 | 60 ms | 300 | 102-89-109 | **-8.1 ± 16.8** — b400 weaker at depth |
+| ftb600_30 | 30 ms | 2360 | 840-730-790 | **+7.4 ± 5.9** (LLR +0.67) |
+| ftb600_60 | 60 ms | 720 | 241-256-223 | **+8.7 ± 10.4** (LLR +0.34) |
+| POOLED b600 | — | 3080 | 1081-986-1013 | **+7.7 ± 5.2 (LLR +1.00)** |
+
+Readings: the extended schedule answers §53's queued question — val-corr
+improves monotonically to b800 but PLAY STRENGTH does not: b800 reads
+clearly negative, b400 (the §53 movement level) reads negative at 60 ms
+on this corpus, and b600 is the measured optimum of the ladder, positive
+at both controls. The val-corr ladder is a movement dial, not a strength
+oracle — the b600 plateau of the val ladder is where the play gain lives.
+Evidence class: the §51 precedent (+10.2 ± 7.1 shipped, LLR peaked +0.76);
+pooled LLR +1.00 here, every control positive, no decay-to-zero signature.
+
+**Toolchain proofs on the shipped integers:** exporter round-trip OK
+(FT_W quantized int16 cap ±880, 3,044 clipped entries of 1.57M = 0.19%;
+FT_W mean|d| 0.60 vs champion); engine-vs-numpy bit-exact 800/800
+probes; d9 bench 176,640 (-2.3% tree drift vs the 180,736 champion —
+the v100 net moves the tree mildly); perft 5 = 4,865,609 and perft 6 =
+119,060,324 exact; fuzznnue 4,082,377 positions / 0 mismatches (the
+accumulator delta-path proof that matters when the FT itself changes);
+fuzzsee 115.9M checks / 0; fuzzGivesCheck 177.3M / 0. PGO host build
+tree-identical (d9 176,640), ~+5% d14 wall.
+
+**Cumulative vs 1.4.15:** 1.4.16 +18.0 ± 6.6 @ 30 ms (§53), this round
++7.7 ± 5.2 pooled on top of the 1.4.16 champion. The FT-unfreeze axis
+yield: +18.0 (§53, first unfreeze) -> +7.7 (this round, same protocol on
+a fresh same-family corpus at 1.37x labels + tuned batch count). The
+axis is now measured near its head-only-era exhaustion point; the next
+real gain likely requires a new axis (deeper teacher d12+, teacher
+diversity, or an architecture change), not more of this one.
+
+**What was NOT run (budget):** the FT_MULT sweep (0.05/0.20 remain
+untested — a full retrain + gate each), b500/b700 point gates (b600 won
+the three-point ladder b400/b600/b800), and a 100 ms control.
+
+**Composition: 1.4.17 = the 1.4.16 engine + net v100-ftd10-ha-b600
+(nnue_net.cpp swap, nothing else in the engine tree) + version bumps
+(api.cpp string, versionCode 54) + the round's training scripts in
+scripts/training/ (reorder_labels.py — the ordered fen-join the shipped
+build_corpus_d10.py assertion requires; assemble_corpus.py — the
+unfiltered per-row champion-forward corpus assembler; run_block.sh /
+run_home.sh — the two-core datagen block runners) + the gate records in
+scripts/host-tools/games/ (ftb*_30/60.json) + the PGO host build
+(binaries/tacturn-1.4.17-linux-x64, tree-identical: d9 176,640).**
+
+Repeatable round: ~3 h of 2-core wall (exits 12 m, corpus datagen 12 m,
+home datagen 6 m, labels 115 m, filter+anchor+assemble 20 m, train 55 m,
+exports+builds+validation 15 m), plus the gate budget (~2 h for the table
+above).
+
+## 55. 1.4.18 — the Lc0-teacher round: scale-corrected distillation (net v110-lc0-ha-b600s45; +93.2 ± 18.3 @ 30 ms and +87.5 ± 17.6 @ 60 ms, both SPRT(0,10) H1, vs shipped 1.4.17)
+
+Mission: execute §54's named next axis — TEACHER DIVERSITY. §54 measured
+the SF-d10 axis near exhaustion (+18.0 then +7.7 with the identical
+protocol) and queued "a new axis (deeper teacher d12+, teacher
+diversity, or an architecture change)". This round changed exactly that
+one variable: the teacher is Lc0 (the robotmoon.com nnue-training-data
+binpacks, Lc0's own search-discovered evaluations — a genuinely
+different signal family from Stockfish's classical search), everything
+else held at §53/§54's protocol.
+
+**Data (chunked, budget-respecting, exactly per the environment):** the
+monthly binpacks are 7-12 GB compressed — over the 9.3 GB disk budget.
+Binpack's 8-14 bytes/position density means a partial HTTP-Range +
+partial-zstd-decode of 64 MB holds ~10M positions (the monthly file
+holds ~1.3B). The 600 s tool boundary (§50-§52 documented, this
+environment enforces it) governed the whole pipeline: every stage is a
+resumable ≤540 s foreground block. Decoded + deduped sample:
+**3.78M unique Lc0-evaluated positions** (2.5x §54's corpus scale),
+labeled with the champion's HCE via 2-core evalpos workers.
+
+**The a\* trap (this round's hard-won finding):** §43's LSQ scale fit
+a\* = d·yhat/yhat² is a REGRESSION SLOPE, not a scale. On SF-family
+labels it lands at 1.16-1.22 (champion and teacher nearly agree, slope
+≈ scale). On Lc0 labels it lands at **0.7774 — an attenuated slope**
+(corr 0.19 × sd-ratio 4.19). Dividing by it inflated targets 5.4x
+(sd 580 cp vs the champion residual's 108 cp; 4.3% of targets beyond
+±1000 cp), saturating the head's clipped activations. The first ladder
+(b400/b600/b800, home-anchored at the champion's full sd) screened at
+**-43 / -37 / n.g.** — a magnitude disaster, not a direction failure:
+the candidate's evals read champion x 0.78 on probes.
+
+**The fix — a measured exposure ladder:** keep the training (direction)
+and re-anchor the deployed exposure post-hoc: home mean pinned to the
+champion's (operating point held, §51 protocol), home sd pinned to
+s x champion's. 200-game 30 ms screens: s=0.30 +115, **s=0.45 +117**,
+s=0.60 +16, s=1.00 -37. The Lc0 direction signal is worth ~+115 when
+exposed at 0.3-0.45x and collapses past 0.5x — the champion's
+HCE+search scaffold can only absorb so much of a 4.19x-spread teacher
+before the blend's calibrated cp meanings break.
+
+**Gates (paired color-swapped openings, §54's runner):**
+
+| gate | control | games | W-D-L | verdict |
+|---|---|---|---|---|
+| sprt30_b600s45 | 30 ms | 290 | 149-68-73 | **H1 ACCEPTED, +93.2 ± 18.3** |
+| sprt60_b600s45 | 60 ms | 300 | 148-78-74 | **H1 ACCEPTED, +87.5 ± 17.6** |
+
+Both LLR paths climbed monotonically through the accept line (+2.94)
+across resume blocks — no first-chunk spikes; the 60 ms gate had to be
+extended across four resume blocks and never wavered below +86.
+
+**A v2 retrain (targets clip(sf-hce, ±600)/1.70, sd-matched to the
+champion) was trained and screened: b600s45 +113.3 ± 23.1 —
+statistically identical to the shipped v1 b600s45 (+117.2 ± 23.1
+screen). v1 kept (it carries the accepted gates).** The v2 experiment
+bounds the remaining headroom of pure target-rescaling at ~0: the
+gain is in the teacher signal + exposure, not the loss geometry.
+
+**Toolchain proofs on the shipped integers:** exporter round-trip OK
+(FT_W int16 cap ±880, 2,242 clipped of 1.57M = 0.14%; FT_W mean|d| 0.56
+vs champion); engine-vs-numpy bit-exact 800/800 probes; fuzznnue 608,504
+positions / 0 mismatches (the accumulator delta-path proof that matters
+when the FT itself changes); perft 5 = 4,865,609 and perft 6 =
+119,060,324 exact; bench d9 = 211,968 (+19.9% tree drift vs 176,640 —
+the Lc0 teacher moves the tree decisively, as a ~+90 Elo eval change
+should).
+
+**Composition: 1.4.18 = the 1.4.17 engine + net v110-lc0-ha-b600s45
+(nnue_net.cpp swap, nothing else in the engine tree) + version bumps
+(api.cpp string, versionCode 55) + the round's training scripts in
+scripts/training/ (sample_lc0.py — the resumable two-phase binpack
+sampler; partial_zstd.py / trunc_binpack.py / check_plain.py — the
+chunked download/decode/verify chain; hce_label.py / home_stats.py /
+corpus_build.py / build_feats_lc0.py — the corpus pipeline;
+train_ft_lc0.py — the FT-unfreeze trainer, A2-robust-scale variant
+included; reanchor_shrink.py — the measured exposure ladder tool;
+diag_evals.py / diag_astar.py — the a*-trap diagnostics;
+build_one.sh / build_cands.sh) + the gate records in
+scripts/host-tools/games/ (sprt30/60_b600s45.json and the screen
+ladder) + the host build (binaries/tacturn-1.4.18-linux-x64,
+tree-identical to the gated binary).**
+
+Repeatable round: ~5 h of 2-core wall (data probe+sample 40 m, HOME
+datagen 12 m, labeling 60 m, corpus+features 20 m, train v1 45 m,
+export+build+validate 25 m, screens 35 m, gates 55 m, v2 retrain
+40 m + its screens 21 m), all inside ≤540 s resumable blocks.
+
+## 56. 1.4.19 — the exposure-corrected second Lc0 round: 8.16M-position boosted corpus + the deployed-scale discovery (net v111-lc0r2-ha-b600s015; +172.0 ± 28.9 @ 30 ms and +192.6 ± 31.9 @ 60 ms, both SPRT(0,10) H1, vs shipped 1.4.18)
+
+Mission: the second autonomous Lc0 round on top of 1.4.18 — more data,
+boosting, longer schedule; ship only if both SPRT gates accept.
+
+**Data (2.65x round 1, cross-month diversity):** four fresh month-file
+prefixes via HTTP-Range + partial-zstd (test80-2024-01/02/05,
+test80-2023-05; 64 MB compressed each; the 2024 v6.min files are ~3x
+denser than round 1's source at ~30M positions/64MB). The round-2
+sampler (deterministic blake2b-64 hashing) excluded every round-1
+corpus position and prior chunks: **6.58M new unique positions**
+(1.70M+1.70M+1.48M+1.70M), merged with the round-1 corpus's 3.08M.
+
+**Boosting:** labels via champion HCE, forward via the 1.4.18 net, and
+the §43 disagreement filter re-run against **1.4.18's** blended eval —
+79.2% of positions disagree >=35 cp with the new champion (the fresh
+error surface): **8.16M training positions**. HOME anchor re-pinned to
+1.4.18's own book-exit distribution (measured: its sd is exactly
+0.45x of 1.4.17's — the round-1 re-anchor reproduced bit-exactly).
+
+**Training:** §53 FT-unfreeze trainer, warm-init from the 1.4.18
+integers, robust targets clip(SF-HCE, ±600)/1.70, 1200-batch cosine,
+one epoch max on fresh positions (no repetition). Val-corr plateau
+0.4743 (b200) -> 0.4910 (b600) -> 0.4947 (b1200) — vs round 1's final
+0.4311: +15% relative teacher match.
+
+**The exposure ladder (this round's finding):** at the champion's
+natural scale (s=1.0 of 1.4.18's home sd) the b600 snapshot screened
+**-34.9**. Shrunk exposure, 200-game 30 ms screens vs 1.4.18:
+
+| s | elo | s | elo |
+|---|---|---|---|
+| 1.00 | -34.9 | 0.35 | +139.0 |
+| 0.70 | +63.2 | 0.25 | +172.8 |
+| 0.50 | +88.7 | **0.15** | **+225.0** |
+| | | 0.10 / 0.05 | +200.2 / +190.8 |
+
+**The null control (the attribution that matters):** the SHIPPED 1.4.18
+net itself, re-anchored to s=0.15 with no new training, screened
+**+227.6 — statistically identical to the trained candidate (+225.0)**.
+A 200-game exposure-matched head-to-head (trained direction vs
+incumbent direction) read -15.6 ± 20.5: the directions are
+indistinguishable in play. The round's deployed gain is therefore the
+EXPOSURE CORRECTION, not the direction: the 1.4.18 operating point
+(residual sd ~65-105 cp on top of HCE) is badly over-exposed at
+bullet controls; at 0.15x the residual seasons the HCE (~10-16 cp
+spread) instead of driving it. §52's blend=77 sweep was measured on
+d10-era nets — the Lc0-era residual wants ~0.15x of 1.4.18's scale
+(~77 x 0.15 effective blend ~12). Mechanism claim is measured, not
+proven; the games are the evidence.
+
+**Gates (paired color-swapped openings, §54's runner):**
+
+| gate | control | games | W-D-L | verdict |
+|---|---|---|---|---|
+| sprt30_r2s015 | 30 ms | 144 | 93-24-27 | **H1 ACCEPTED, +172.0 ± 28.9** |
+| sprt60_r2s015 | 60 ms | 133 | 92-16-25 | **H1 ACCEPTED, +192.6 ± 31.9** |
+
+Both LLR paths climbed monotonically through the accept line. The 60 ms
+reading exceeds 30 ms — the gain strengthens with depth, consistent with
+an eval that misprices less rather than a time-control artifact.
+
+**Toolchain proofs on the shipped integers:** exporter round-trip OK;
+engine-vs-numpy bit-exact 800/800 probes; fuzznnue 812,257 positions /
+0 mismatches; perft 5 = 4,865,609 and perft 6 = 119,060,324 exact;
+bench d9 = 252,416 (tree-identical rebuild verified).
+
+**Composition: 1.4.19 = the 1.4.18 engine + net v111-lc0r2-ha-b600s015
+(nnue_net.cpp swap, nothing else in the engine tree) + version bumps
+(api.cpp string, versionCode 56) + the round's training scripts in
+scripts/training/ (round2_sample.py — the resumable cross-chunk
+deduping sampler; round2_corpus.py — label/forward/build/feats
+pipeline; home_stats18.py / make_null18.py — the 1.4.18 re-anchor and
+null-control tools; train_ft_lc0.py — now R2-switchable) + the gate
+records in scripts/host-tools/games/ (sprt30/60_r2s015.json, the
+exposure-ladder screens scr2_*, the null controls, the head-to-head)
++ the host build (binaries/tacturn-1.4.19-linux-x64).**
+
+Repeatable round: ~5.5 h of 2-core wall (data 40 m, labels 10 m,
+forward 25 m, corpus+feats 5 m, train 75 m, ladder+screens 70 m,
+gates 15 m, validation+finalization 20 m), all inside <=540 s resumable
+blocks. Queued next: the blend/exposure re-tune as a first-class
+search-side sweep (blend constant itself, not net re-anchoring); the
+s=0.15 residual's interaction with razoring/futility margins
+(HCE-era-tuned) is the named suspect for the next round.
+
+## 57. 1.4.20 — the round-3 exposure optimum: trained candidates measured and rejected, the s=0.25 re-anchor ships (net v113-null19-ha-s025; +31.8 ± 9.6 @ 30 ms and +48.6 ± 12.3 @ 60 ms, both SPRT(0,10) H1, vs shipped 1.4.19)
+
+Mission: the third autonomous Lc0 round on top of 1.4.19 — fresh months,
+43-filtered corpus, longer schedule; ship only if both SPRT gates accept.
+
+**Data (third fresh slice, no reuse):** four month prefixes never touched
+in rounds 1–2 (test80-2024-03/04/06 + 2023-07; v6.min where available),
+deterministic blake2b-64 cross-round exclusion, HCE champion labels,
+1.4.19-net forward pass, the §43 disagreement filter re-run against
+**1.4.19's** blended eval: 77.8% disagreement, **8.25M training
+positions**. HOME anchor re-pinned to 1.4.19's own book-exit
+distribution (home_stats19; the shipped net's home statistics verified
+to reproduce exactly — all 16 buckets sd/sd_ch = 1.000, mu offset 0.00
+cp).
+
+**Training:** the §53 FT-unfreeze trainer, warm-init from the 1.4.19
+integers, robust targets A2=1.70, 1200-batch cosine, one epoch on fresh
+positions. Full snapshot ladder b200–b1200 preserved. (A sandbox-wipe
+incident cost the b400–b1200 snapshots once; training resumed from the
+saved cursor/optimizer state — corpus-plan-state alignment verified
+before resuming.)
+
+**The round-3 ladder (200-game 30 ms screens vs the 1.4.19 champion):**
+the trained b1200 family at matched exposure s=1.0 screened **−1.7**;
+at s=0.45 **+10.4**. The b1000 mid-training snapshot at s=0.35
+screened **+36.6** — b1200 overfits (val-corr ≠ Elo, the §54 lesson
+again). The null family (the SHIPPED 1.4.19 net, pure re-anchor):
+
+| s | elo | n | | s | elo | n |
+|---|---|---|---|---|---|---|
+| 1.00 | 0 | — | | 0.30 | +29.6 | 200 |
+| 0.45 | +8.7 | 200 | | **0.25** | **+49.0** | 600 |
+| 0.40 | +6.9 | 200 | | 0.20 | +40.1 | 600 |
+| 0.35 | +57.9 | 200 | | 0.15 | +1.7 | 200 |
+
+**Attribution (the honest ledger):** every trained variant loses to
+the null at matched exposure (b1200s035 −12.2 vs null19s035 +57.9 — a
+~70-elo training DEBT). The round's deployed gain is again the
+EXPOSURE CORRECTION, refined one notch: 1.4.19 shipped at s=0.15 of
+1.4.18's sd; the true optimum in its own frame is **s=0.25** (0.15
+of 1.4.18 ≈ 0.25 of 1.4.19 — the two rounds' re-anchors compose).
+The paired 600-game probes decide the peak: s025 +49.0 vs s020
++40.1 (shared openings, paired colors). A 200-game s035 read of
++57.9 was accepted as noise (CI ±21, inconsistent with both
+neighbours) — the 600-game probes at s020/s025 carry the decision.
+
+**Build-forensics note (recorded for the next maintainer):** the
+first s030/s040 builds silently compiled the CHAMPION net — a
+wrong source path (delta_ft_lc0_null19.npz vs the actual
+delta_null19.npz) made the export step fail while the engine build
+proceeded on the stale nnue_net.cpp. The screens exposed it
+immediately: null19s030 screened exactly 0.0 with bench identical
+to the champion — an accidental champ-vs-champ calibration of the
+harness (77-46-77, dead even). Rule banked: **a null screen that
+reads exactly 0.0 with a champ-identical bench is a build failure,
+not a measurement.** The fix path (build_densify2.sh) checks
+net-existence before compiling.
+
+**Gates (paired color-swapped openings, §54's runner):**
+
+| gate | control | games | W-D-L | verdict |
+|---|---|---|---|---|
+| sprt30_r3s025 | 30 ms | 997 | 423-242-332 | **H1 ACCEPTED, +31.8 ± 9.6** |
+| sprt60_r3s025 | 60 ms | 612 | 274-149-189 | **H1 ACCEPTED, +48.6 ± 12.3** |
+
+Both LLR paths climbed monotonically through the accept line. The
+60 ms reading again exceeds 30 ms — the exposure-corrected residual
+keeps gaining with depth (same signature as 1.4.19's gates).
+
+**Toolchain proofs on the shipped integers:** exporter round-trip OK;
+engine-vs-numpy bit-exact 400/400 probes; fuzznnue 407,555 positions /
+0 mismatches; perft 5 = 4,865,609 and perft 6 = 119,060,324 exact;
+bench d9 = 230,912 (the gated binary and the version-bumped release
+build agree fingerprint-for-fingerprint; the release differs from the
+gated candidate only in the api.cpp version string).
+
+**Composition: 1.4.20 = the 1.4.19 engine + net v113-null19-ha-s025
+(nnue_net.cpp swap, nothing else in the engine tree) + version bumps
+(api.cpp string, versionCode 57) + the round's training scripts in
+scripts/training/ (round3_sample.py — the third-slice cross-round
+exclusion sampler; r3_corpus.py / r3_label*.py / r3_pass1.py /
+r3_forward.py / r3_home_anchor.py — the corpus pipeline;
+r3_verify*.py / r3_check.py — the resume-forensics validators;
+make_null19.py — the 1.4.19-frame null-control builder;
+build_ladder.sh / build_densify2.sh / build_low.sh / build_nulls.sh /
+screen_r3.sh — the resumable one-chunk-per-call drivers) + the gate
+records in scripts/host-tools/games/ (sprt30/60_r3s025.json, the
+s035 gates, the full r3scr_* exposure screens, the 600-game
+probe20/probe25 deciders) + the host build
+(binaries/tacturn-1.4.20-linux-x64).**
+
+Repeatable round: ~6 h of 2-core wall (data 45 m, labels 15 m,
+forward 30 m, corpus+feats 5 m, train 80 m incl. the wipe-resume,
+ladder+screens 150 m, gates 90 m, validation+finalization 25 m),
+all inside <=540 s resumable blocks — plus three backend-crash
+restarts and two full sandbox wipes survived with zero re-measured
+games (all jsons resume-aware). Queued next: the exposure sweep as
+a search-side constant (per-bucket StaticBlendPct instead of net
+re-anchoring — the s=0.25-equivalent blend without touching the
+net); the possibility that the trained direction HELPS once the
+exposure is fixed first (train-from-the-re-anchored-point, not
+re-anchor-after-train) is the named experiment for the next round.
+
 ---
 
 ## Public repository — V1.1 release (= internal 1.4.11)
@@ -5050,3 +5414,18 @@ host changes were needed; the new `datagen`/training tooling of the app
 project is not part of the public repo. Bench identity moved from 171,520
 to **180,736** (matches the author's own 1.4.16 build); 33/33 protocol
 checks pass on x86-64 / v3 / v4.
+
+---
+
+## Public repository — V1.2 release (= internal 1.4.20)
+
+New public release **V1.2**. Compared with the V1.1 build above, only the
+embedded NNUE network changed (`nnue_net.cpp` = net `v113-null19-ha-s025`,
+HISTORY §54–§57); engine code, clock manager and UCI host are unchanged, and
+`ttable.h` keeps its Windows-portable allocator. **Disclosure:** §55–§57
+(1.4.18–1.4.20) used Leela Chess Zero evaluations (robotmoon.com
+nnue-training-data binpacks, curated by Linmiao Xu / linrock, derived from
+Lc0 "test80" self-play data) as the supervised teacher instead of Stockfish;
+credits and scope are stated in README. Bench identity: `bench 9` = 230,912
+(matches the author's own 1.4.20 build); 33/33 protocol checks pass on
+x86-64 / v3 / v4.

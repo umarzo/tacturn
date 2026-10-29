@@ -1,4 +1,45 @@
-# TacTurn V1.1 — Release Notes (current build: internal 1.4.16)
+# TacTurn V1.2 — Release Notes (internal 1.4.20)
+
+Author: **Umar Khan** · License: MIT · `id name TacTurn V1.2`.
+Binaries are named `TacTurn-V1.2-x86-64[-v3|-v4][.exe]`. **Replace all
+earlier V1 / V1.1 files with these.** The notes of the earlier releases are
+kept below.
+
+## What is new in V1.2
+
+- **New NNUE net `v113-null19-ha-s025`** (internal 1.4.17 → 1.4.20). Only the
+  embedded network changed; search, clock manager and UCI layer are
+  unchanged from V1.1.
+- **Lc0-derived training data (disclosure).** Three training rounds
+  (1.4.18, 1.4.19, 1.4.20) used **Leela Chess Zero's search evaluations** as
+  the teacher, sampled from the public Lc0 NNUE-training binpacks hosted by
+  Linmiao Xu (linrock) at robotmoon.com/nnue-training-data. Previously the
+  teacher was Stockfish 17.1. No Lc0 code or network file is included, and no
+  data is redistributed. README "Credits, training data & transparency"
+  gives full credits.
+- **Measured self-play results vs the previous shipped net** (SPRT(0,10),
+  30 ms / 60 ms controls): 1.4.17 +7.7 ± 5.2 pooled; 1.4.18 +93.2 ± 18.3 /
+  +87.5 ± 17.6; 1.4.19 +172.0 ± 28.9 / +192.6 ± 31.9; 1.4.20 +31.8 ± 9.6 /
+  +48.6 ± 12.3. These are very-fast-control internal results, not additive
+  and not a CCRL rating. Note (HISTORY §57): the 1.4.20 gain came from
+  re-anchoring the 1.4.19 net's output scale (s = 0.25); all freshly trained
+  candidates in that round lost to it.
+- **New bench identity: `bench 9` = 230,912 nodes** (identical on all three
+  tiers and identical to the author's own 1.4.20 build).
+- Default options unchanged: `Hash` 32 MB, `Move Overhead` 60 ms,
+  `NNUEBlend` 77, `StaticBlend` 72.
+
+## Verification
+
+- `bench 9` = 230,912 on `x86-64`, `x86-64-v3`, `x86-64-v4` (Linux builds).
+- `scripts/verify_uci.py`: 33 checks, all passing on all three Linux tiers.
+- Windows `.exe` builds are cross-compiled with MinGW-w64 (static) from the
+  same source; they were not executed in the build environment — confirm on
+  a real Windows machine.
+
+---
+
+# TacTurn V1.1 — previous release notes (internal 1.4.16, kept for history)
 
 Author: **Umar Khan** · License: MIT. The release stays **V1.1**
 (public V1 = internal 1.4.9; V1.1 = internal 1.4.16, `id name TacTurn V1.1`).
