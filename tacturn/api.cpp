@@ -58,7 +58,7 @@ uint64_t tacturn_pgo_train(int32_t seconds) {
     return totalNodes;
 }
 
-const char *tacturn_version(void) { return "TacTurn V1.1"; }
+const char *tacturn_version(void) { return "TacTurn V1.2"; }
 
 int32_t tacturn_api_version(void) { return TACTURN_API_VERSION; }
 
