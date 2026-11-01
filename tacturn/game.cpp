@@ -61,6 +61,11 @@ void GameSession::reset(const char *fen) {
     records.clear();
     legalCacheValid = false;
     resultOverride = 0;
+    // v1.4.27 (T3b): the searcher's per-side last-score record is
+    // game-level context — a new game must not inherit the previous
+    // game's final scores (the T3 cross-move trigger would misread them
+    // as falling-eval instability on move 1).
+    searcher.resetGameContext();
 }
 
 bool GameSession::setFen(const char *fen) {

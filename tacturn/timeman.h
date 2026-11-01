@@ -147,6 +147,29 @@ public:
         // hit (and a forced full-pace bypass) before any real signal
         // exists. Guard both the swing and the falling-eval test on the
         // score being a real one.
+        //
+        // v1.4.27 (T1): stability_ is advanced BEFORE the falling-eval
+        // computation (moved up from below), and the cross-move term is
+        // gated on stability_ < 2. Rationale: lastScore is a REAL score
+        // now (the harness preserves it across game continuations, and
+        // the Android app always supplied one), so `lastScore - score >
+        // 30` — a historical drop from two plies ago — fired on EVERY
+        // iteration of the current move even when the search had settled
+        // on the same best move for 5+ consecutive depths. That locked
+        // unstable_ = true permanently: the 0.70x stability and 0.65x
+        // node-fraction shrinks were cancelled (scale forced back to
+        // 1.0) AND the 1.5x unstable extension kept engaging — a 3.3x
+        // clock drain on completely settled positions (measured -88.7
+        // Elo unguarded vs +5.8 guarded at 1.5s+0.02s). With the gate,
+        // the cross-move trigger still protects the first two settled
+        // iterations of a genuinely worsening position, then normal
+        // stability pacing takes over.
+        if (bestMove != MOVE_NONE && bestMove == prevBestMove) {
+            if (completedDepth >= 6) stability_++;
+        } else {
+            stability_ = 0;
+        }
+
         int scoreSwing = 0;
         bool fallingEval = false;
         if (prevScore > -30000) {  // a real previous score, not the init
@@ -157,24 +180,20 @@ public:
             // since the engine's PREVIOUS MOVE but is flat across
             // iterations reads as settled and gets shrunk — exactly when
             // the unstable extension should engage.
-            fallingEval = prevScore - score > 15 || lastScore - score > 30;
-        }
-
-        // v1.4.0: best-move stability — consecutive completed iterations
-        // that kept the same best move.
-        // v1.4.3 fix (free-depth guard): depths 1-6 complete in microseconds
-        // and almost always repeat the obvious root move — counting them let
-        // stability_ reach its deepest shrink tier (0.70) after ~3 ms, before
-        // the time-consuming iterations where the signal is actually earned
-        // began, pre-shrinking paceMs_ for the whole real search. Only
-        // iterations at completedDepth >= 6 INCREMENT now; a best-move
-        // change at ANY depth still resets (a flip-flop is instability
-        // evidence even when cheap). Fixed-movetime searches never reach
-        // this code (no TimeManager); the change affects clocked play only.
-        if (bestMove != MOVE_NONE && bestMove == prevBestMove) {
-            if (completedDepth >= 6) stability_++;
-        } else {
-            stability_ = 0;
+            // v1.4.26 (T3): guard the cross-move term on lastScore being a
+            // REAL score. The UCI harness historically never set
+            // SearchLimits::lastScore, so it arrived as the old default 0 —
+            // and with the engine at any score below -30 cp the test
+            // "0 - score > 30" was true on every iteration of every move,
+            // forcing fallingEval -> unstable_ -> the 1.5x unstable
+            // extension on positions that were perfectly settled. The
+            // -INFINITE sentinel (search.h) plus this guard kills the
+            // phantom; the harness now also passes the true per-side score.
+            // v1.4.27 (T1): ... and the stability_ < 2 gate above stops the
+            // real-score form from permanently locking a settled search.
+            fallingEval = prevScore - score > 15 ||
+                          (stability_ < 2 && lastScore > -30000 &&
+                           lastScore - score > 30);
         }
 
         // v1.4.0: falling eval — the score is dropping for the mover. The
@@ -218,7 +237,17 @@ public:
         // When unstable, bypass the shrink entirely so paceMs_ = soft and
         // the extension genuinely reaches 1.5x soft (hard cap still walls
         // everything).
-        if (unstable_) scale = 1.0;
+        // v1.4.25 (T1): the bypass only cancels a NET SHRINK now
+        // (scale < 1.0). The old unconditional `scale = 1.0` also wiped
+        // the v1.4.1 contested-root boost (frac = 1.15 / 1.30 when
+        // bestMoveNodesPerMille < 350) almost every time it applied: a
+        // contested root almost always co-occurs with moveChanged /
+        // aspirationResearched / fallingEval (unstable_ == true), so the
+        // 1.15x-1.30x pacing never survived to the iteration-start
+        // decision. Preserving scale > 1.0 spends the banked time exactly
+        // where the contested-root policy intended. Depth-limited
+        // searches (bench) never reach this code — clocked play only.
+        if (unstable_ && scale < 1.0) scale = 1.0;
         if (scale < 0.50) scale = 0.50;
         paceMs_ = (int64_t)(softBudgetMs_ * scale);
         // v1.4.11 fix (order): apply the pacing floor BEFORE the hard-cap
@@ -242,8 +271,25 @@ public:
             reason_ = "depth-floor";
             return true;
         }
+        // v1.4.27 (N5): the crisis-tiered unstable extension (1.75x cap
+        // when the score plunged > 60 cp intra-move / > 70 cp cross-move)
+        // was A/B tested against the shipped 1.4.26 baseline at 1.5 s +
+        // 0.02 s and REJECTED: it cost ~15-20 Elo there (the extension
+        // fires on ordinary positional drift at longer clocks — the eval's
+        // iteration-to-iteration volatility routinely exceeds the 60 cp
+        // threshold — and overspends into time trouble), while measuring
+        // neutral at 0.5 s + 0.01 s and being inert at fixed nodes. The
+        // flat historical 110%/150% pacing is kept; the hard-cap clamp
+        // (T1) still walls everything.
+        int64_t unstableCap = paceMs_ * 150 / 100;
+        if (unstableCap > hardCapMs_) unstableCap = hardCapMs_;
         if (unstable_ && elapsedMs < paceMs_ * 110 / 100 &&
-            elapsedMs + estMs <= paceMs_ * 150 / 100) {
+            // v1.4.27 (T1): never extend INTO the hard wall. In clocked
+            // play unspent time is banked for future moves (unlike
+            // movetime), so an extension whose estimate overshoots
+            // hardCapMs_ just donates the tail to the abort path. The
+            // unstableCap clamp above subsumes this for both tiers.
+            elapsedMs + estMs <= unstableCap) {
             reason_ = "unstable";
             return true;
         }

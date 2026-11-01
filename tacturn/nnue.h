@@ -159,7 +159,16 @@ extern uint64_t dataSinkMask;
 extern void *dataSinkCtx;
 
 // ---- incremental accumulator ----
-struct Accumulator {
+// v1.4.26 (B2): 64-byte cache-line alignment. The struct previously had
+// only the natural 2-byte int16_t alignment, which placed
+// Position::nnueRing at byte offset 212 (== 20 mod 64, 4 mod 32) — every
+// second 32-byte AVX2 load/store and EVERY 64-byte AVX-512 load/store in
+// accFusedRows / clipBiasNz* / accAddRow straddled a cache-line boundary
+// across the ~950k accumulator updates and ~790k forward passes of a
+// bench-14 run. alignas(64) puts every ring slot (and every Finny cache
+// entry) on an exact cache line. Bit-exact: alignment changes addressing
+// only, never values.
+struct alignas(64) Accumulator {
     int16_t v[2][L1];
 };
 
@@ -174,7 +183,7 @@ struct Accumulator {
  *  piece on the board. Bit-exact: int16 accumulator arithmetic wraps
  *  (mod 2^16, associative), so cached-plus-delta equals the from-scratch
  *  square-order sum. */
-struct FinnyEntry {
+struct alignas(64) FinnyEntry {
     int16_t acc[L1];
     Bitboard pieces[2][6];  // placement the acc represents (color, type)
     bool valid = false;
@@ -271,9 +280,91 @@ inline void accShiftPerspRows(int16_t *p, const int16_t *rF, const int16_t *rT) 
 // the 2 KB accumulator collapses into ONE pass. int16 SIMD arithmetic is
 // modular (associative and commutative), so grouping all subtractions
 // before the additions is element-wise identical to any op ordering.
+// v1.4.27 (N6): optional dst2 — the SAME computed value is stored to a
+// second destination in the same pass (single-pass Finny refresh: the
+// delta updates the Finny cache entry AND the ring-slot perspective with
+// one read of src, eliminating the trailing 1 KB memcpy pass). dst2 must
+// not alias src/sub/add; dst==src (in-place) remains valid.
+// v1.4.28 (B3): dedicated REGISTER-PASSED accFused1x1 / accFused2x1 forms
+// for the two dominant op shapes. applyMoveAcc called accFusedRows through
+// a stack sub[2]/add[1] pointer array with runtime nSub/nAdd branches on
+// the hottest replay path; the dedicated kernels take the row pointers as
+// direct arguments, so the pointer-array stores/loads and the shape test
+// disappear entirely. Same modular int16 arithmetic — bit-identical.
+
+inline void accFused1x1(int16_t *dst, const int16_t *src,
+                        const int16_t *s0, const int16_t *a0) {
+    for (int i = 0; i < L1; i += 32) {
+        __m512i v = _mm512_loadu_si512((const void *)(src + i));
+        v = _mm512_add_epi16(_mm512_sub_epi16(v, _mm512_loadu_si512((const void *)(s0 + i))),
+                             _mm512_loadu_si512((const void *)(a0 + i)));
+        _mm512_storeu_si512((void *)(dst + i), v);
+    }
+}
+
+inline void accFused2x1(int16_t *dst, const int16_t *src,
+                        const int16_t *s0, const int16_t *s1, const int16_t *a0) {
+    for (int i = 0; i < L1; i += 32) {
+        __m512i v = _mm512_loadu_si512((const void *)(src + i));
+        v = _mm512_sub_epi16(v, _mm512_loadu_si512((const void *)(s0 + i)));
+        v = _mm512_add_epi16(_mm512_sub_epi16(v, _mm512_loadu_si512((const void *)(s1 + i))),
+                             _mm512_loadu_si512((const void *)(a0 + i)));
+        _mm512_storeu_si512((void *)(dst + i), v);
+    }
+}
+
 inline void accFusedRows(int16_t *dst, const int16_t *src,
                          const int16_t *const *sub, int nSub,
-                         const int16_t *const *add, int nAdd) {
+                         const int16_t *const *add, int nAdd,
+                         int16_t *dst2 = nullptr) {
+    // v1.4.24 (L3): specialized 2x-unrolled fast paths for the two move
+    // classes that cover >99% of lazy-ring materializations — quiet moves
+    // (1 sub / 1 add: any non-king quiet, promotions) and plain captures
+    // (2 sub / 1 add: victim + mover, EP, promo-captures). The generic
+    // loop's runtime k-loop bounds and pointer-array reloads (two branches
+    // + two loads per 64-byte chunk — 32 chunks per 1 KB perspective)
+    // collapse into straight-line SIMD with register-hoisted row pointers.
+    // Same modular int16 arithmetic element-wise; bit-identical bytes.
+    if (nSub == 1 && nAdd == 1) {
+        const int16_t *s0 = sub[0];
+        const int16_t *a0 = add[0];
+        for (int i = 0; i < L1; i += 64) {
+            __m512i v0 = _mm512_loadu_si512((const void *)(src + i));
+            __m512i v1 = _mm512_loadu_si512((const void *)(src + i + 32));
+            v0 = _mm512_add_epi16(_mm512_sub_epi16(v0, _mm512_loadu_si512((const void *)(s0 + i))),
+                                  _mm512_loadu_si512((const void *)(a0 + i)));
+            v1 = _mm512_add_epi16(_mm512_sub_epi16(v1, _mm512_loadu_si512((const void *)(s0 + i + 32))),
+                                  _mm512_loadu_si512((const void *)(a0 + i + 32)));
+            _mm512_storeu_si512((void *)(dst + i), v0);
+            _mm512_storeu_si512((void *)(dst + i + 32), v1);
+            if (dst2) {
+                _mm512_storeu_si512((void *)(dst2 + i), v0);
+                _mm512_storeu_si512((void *)(dst2 + i + 32), v1);
+            }
+        }
+        return;
+    }
+    if (nSub == 2 && nAdd == 1) {
+        const int16_t *s0 = sub[0], *s1 = sub[1];
+        const int16_t *a0 = add[0];
+        for (int i = 0; i < L1; i += 64) {
+            __m512i v0 = _mm512_loadu_si512((const void *)(src + i));
+            __m512i v1 = _mm512_loadu_si512((const void *)(src + i + 32));
+            v0 = _mm512_sub_epi16(v0, _mm512_loadu_si512((const void *)(s0 + i)));
+            v1 = _mm512_sub_epi16(v1, _mm512_loadu_si512((const void *)(s0 + i + 32)));
+            v0 = _mm512_add_epi16(_mm512_sub_epi16(v0, _mm512_loadu_si512((const void *)(s1 + i))),
+                                  _mm512_loadu_si512((const void *)(a0 + i)));
+            v1 = _mm512_add_epi16(_mm512_sub_epi16(v1, _mm512_loadu_si512((const void *)(s1 + i + 32))),
+                                  _mm512_loadu_si512((const void *)(a0 + i + 32)));
+            _mm512_storeu_si512((void *)(dst + i), v0);
+            _mm512_storeu_si512((void *)(dst + i + 32), v1);
+            if (dst2) {
+                _mm512_storeu_si512((void *)(dst2 + i), v0);
+                _mm512_storeu_si512((void *)(dst2 + i + 32), v1);
+            }
+        }
+        return;
+    }
     for (int i = 0; i < L1; i += 32) {
         __m512i v = _mm512_loadu_si512((const void *)(src + i));
         for (int k = 0; k < nSub; k++)
@@ -281,10 +372,43 @@ inline void accFusedRows(int16_t *dst, const int16_t *src,
         for (int k = 0; k < nAdd; k++)
             v = _mm512_add_epi16(v, _mm512_loadu_si512((const void *)(add[k] + i)));
         _mm512_storeu_si512((void *)(dst + i), v);
+        if (dst2) _mm512_storeu_si512((void *)(dst2 + i), v);
     }
 }
 
 #elif defined(__AVX2__)
+
+// v1.4.28 (B3): register-passed fast forms (see the AVX-512 variant's
+// note) — bit-identical.
+inline void accFused1x1(int16_t *dst, const int16_t *src,
+                        const int16_t *s0, const int16_t *a0) {
+    for (int i = 0; i < L1; i += 32) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + i));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + i + 16));
+        v0 = _mm256_add_epi16(_mm256_sub_epi16(v0, _mm256_loadu_si256((const __m256i *)(s0 + i))),
+                              _mm256_loadu_si256((const __m256i *)(a0 + i)));
+        v1 = _mm256_add_epi16(_mm256_sub_epi16(v1, _mm256_loadu_si256((const __m256i *)(s0 + i + 16))),
+                              _mm256_loadu_si256((const __m256i *)(a0 + i + 16)));
+        _mm256_storeu_si256((__m256i *)(dst + i), v0);
+        _mm256_storeu_si256((__m256i *)(dst + i + 16), v1);
+    }
+}
+
+inline void accFused2x1(int16_t *dst, const int16_t *src,
+                        const int16_t *s0, const int16_t *s1, const int16_t *a0) {
+    for (int i = 0; i < L1; i += 32) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + i));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + i + 16));
+        v0 = _mm256_sub_epi16(v0, _mm256_loadu_si256((const __m256i *)(s0 + i)));
+        v1 = _mm256_sub_epi16(v1, _mm256_loadu_si256((const __m256i *)(s0 + i + 16)));
+        v0 = _mm256_add_epi16(_mm256_sub_epi16(v0, _mm256_loadu_si256((const __m256i *)(s1 + i))),
+                              _mm256_loadu_si256((const __m256i *)(a0 + i)));
+        v1 = _mm256_add_epi16(_mm256_sub_epi16(v1, _mm256_loadu_si256((const __m256i *)(s1 + i + 16))),
+                              _mm256_loadu_si256((const __m256i *)(a0 + i + 16)));
+        _mm256_storeu_si256((__m256i *)(dst + i), v0);
+        _mm256_storeu_si256((__m256i *)(dst + i + 16), v1);
+    }
+}
 
 inline void accAddRow(int16_t *dst, const int16_t *row) {
     for (int i = 0; i < L1; i += 16) {
@@ -327,7 +451,50 @@ inline void accShiftPerspRows(int16_t *p, const int16_t *rF, const int16_t *rT) 
 
 inline void accFusedRows(int16_t *dst, const int16_t *src,
                          const int16_t *const *sub, int nSub,
-                         const int16_t *const *add, int nAdd) {
+                         const int16_t *const *add, int nAdd,
+                         int16_t *dst2 = nullptr) {
+    // v1.4.24 (L3): specialized 2x-unrolled fast paths for (1,1) quiets
+    // and (2,1) captures — see the AVX-512 variant's note. Bit-identical.
+    if (nSub == 1 && nAdd == 1) {
+        const int16_t *s0 = sub[0];
+        const int16_t *a0 = add[0];
+        for (int i = 0; i < L1; i += 32) {
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + i));
+            __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + i + 16));
+            v0 = _mm256_add_epi16(_mm256_sub_epi16(v0, _mm256_loadu_si256((const __m256i *)(s0 + i))),
+                                  _mm256_loadu_si256((const __m256i *)(a0 + i)));
+            v1 = _mm256_add_epi16(_mm256_sub_epi16(v1, _mm256_loadu_si256((const __m256i *)(s0 + i + 16))),
+                                  _mm256_loadu_si256((const __m256i *)(a0 + i + 16)));
+            _mm256_storeu_si256((__m256i *)(dst + i), v0);
+            _mm256_storeu_si256((__m256i *)(dst + i + 16), v1);
+            if (dst2) {
+                _mm256_storeu_si256((__m256i *)(dst2 + i), v0);
+                _mm256_storeu_si256((__m256i *)(dst2 + i + 16), v1);
+            }
+        }
+        return;
+    }
+    if (nSub == 2 && nAdd == 1) {
+        const int16_t *s0 = sub[0], *s1 = sub[1];
+        const int16_t *a0 = add[0];
+        for (int i = 0; i < L1; i += 32) {
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + i));
+            __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + i + 16));
+            v0 = _mm256_sub_epi16(v0, _mm256_loadu_si256((const __m256i *)(s0 + i)));
+            v1 = _mm256_sub_epi16(v1, _mm256_loadu_si256((const __m256i *)(s0 + i + 16)));
+            v0 = _mm256_add_epi16(_mm256_sub_epi16(v0, _mm256_loadu_si256((const __m256i *)(s1 + i))),
+                                  _mm256_loadu_si256((const __m256i *)(a0 + i)));
+            v1 = _mm256_add_epi16(_mm256_sub_epi16(v1, _mm256_loadu_si256((const __m256i *)(s1 + i + 16))),
+                                  _mm256_loadu_si256((const __m256i *)(a0 + i + 16)));
+            _mm256_storeu_si256((__m256i *)(dst + i), v0);
+            _mm256_storeu_si256((__m256i *)(dst + i + 16), v1);
+            if (dst2) {
+                _mm256_storeu_si256((__m256i *)(dst2 + i), v0);
+                _mm256_storeu_si256((__m256i *)(dst2 + i + 16), v1);
+            }
+        }
+        return;
+    }
     for (int i = 0; i < L1; i += 16) {
         __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
         for (int k = 0; k < nSub; k++)
@@ -335,6 +502,7 @@ inline void accFusedRows(int16_t *dst, const int16_t *src,
         for (int k = 0; k < nAdd; k++)
             v = _mm256_add_epi16(v, _mm256_loadu_si256((const __m256i *)(add[k] + i)));
         _mm256_storeu_si256((__m256i *)(dst + i), v);
+        if (dst2) _mm256_storeu_si256((__m256i *)(dst2 + i), v);
     }
 }
 
@@ -379,9 +547,84 @@ inline void accShiftPerspRows(int16_t *p, const int16_t *rF, const int16_t *rT) 
     }
 }
 
+// v1.4.28 (B3): register-passed fast forms (see the AVX-512 variant's
+// note) — bit-identical.
+inline void accFused1x1(int16_t *dst, const int16_t *src,
+                        const int16_t *s0, const int16_t *a0) {
+    for (int i = 0; i < L1; i += 16) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(src + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(src + i + 8));
+        v0 = _mm_add_epi16(_mm_sub_epi16(v0, _mm_loadu_si128((const __m128i *)(s0 + i))),
+                           _mm_loadu_si128((const __m128i *)(a0 + i)));
+        v1 = _mm_add_epi16(_mm_sub_epi16(v1, _mm_loadu_si128((const __m128i *)(s0 + i + 8))),
+                           _mm_loadu_si128((const __m128i *)(a0 + i + 8)));
+        _mm_storeu_si128((__m128i *)(dst + i), v0);
+        _mm_storeu_si128((__m128i *)(dst + i + 8), v1);
+    }
+}
+
+inline void accFused2x1(int16_t *dst, const int16_t *src,
+                        const int16_t *s0, const int16_t *s1, const int16_t *a0) {
+    for (int i = 0; i < L1; i += 16) {
+        __m128i v0 = _mm_loadu_si128((const __m128i *)(src + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i *)(src + i + 8));
+        v0 = _mm_sub_epi16(v0, _mm_loadu_si128((const __m128i *)(s0 + i)));
+        v1 = _mm_sub_epi16(v1, _mm_loadu_si128((const __m128i *)(s0 + i + 8)));
+        v0 = _mm_add_epi16(_mm_sub_epi16(v0, _mm_loadu_si128((const __m128i *)(s1 + i))),
+                           _mm_loadu_si128((const __m128i *)(a0 + i)));
+        v1 = _mm_add_epi16(_mm_sub_epi16(v1, _mm_loadu_si128((const __m128i *)(s1 + i + 8))),
+                           _mm_loadu_si128((const __m128i *)(a0 + i + 8)));
+        _mm_storeu_si128((__m128i *)(dst + i), v0);
+        _mm_storeu_si128((__m128i *)(dst + i + 8), v1);
+    }
+}
+
 inline void accFusedRows(int16_t *dst, const int16_t *src,
                          const int16_t *const *sub, int nSub,
-                         const int16_t *const *add, int nAdd) {
+                         const int16_t *const *add, int nAdd,
+                         int16_t *dst2 = nullptr) {
+    // v1.4.24 (L3): specialized 2x-unrolled fast paths for (1,1) quiets
+    // and (2,1) captures — see the AVX-512 variant's note. Bit-identical.
+    if (nSub == 1 && nAdd == 1) {
+        const int16_t *s0 = sub[0];
+        const int16_t *a0 = add[0];
+        for (int i = 0; i < L1; i += 16) {
+            __m128i v0 = _mm_loadu_si128((const __m128i *)(src + i));
+            __m128i v1 = _mm_loadu_si128((const __m128i *)(src + i + 8));
+            v0 = _mm_add_epi16(_mm_sub_epi16(v0, _mm_loadu_si128((const __m128i *)(s0 + i))),
+                               _mm_loadu_si128((const __m128i *)(a0 + i)));
+            v1 = _mm_add_epi16(_mm_sub_epi16(v1, _mm_loadu_si128((const __m128i *)(s0 + i + 8))),
+                               _mm_loadu_si128((const __m128i *)(a0 + i + 8)));
+            _mm_storeu_si128((__m128i *)(dst + i), v0);
+            _mm_storeu_si128((__m128i *)(dst + i + 8), v1);
+            if (dst2) {
+                _mm_storeu_si128((__m128i *)(dst2 + i), v0);
+                _mm_storeu_si128((__m128i *)(dst2 + i + 8), v1);
+            }
+        }
+        return;
+    }
+    if (nSub == 2 && nAdd == 1) {
+        const int16_t *s0 = sub[0], *s1 = sub[1];
+        const int16_t *a0 = add[0];
+        for (int i = 0; i < L1; i += 16) {
+            __m128i v0 = _mm_loadu_si128((const __m128i *)(src + i));
+            __m128i v1 = _mm_loadu_si128((const __m128i *)(src + i + 8));
+            v0 = _mm_sub_epi16(v0, _mm_loadu_si128((const __m128i *)(s0 + i)));
+            v1 = _mm_sub_epi16(v1, _mm_loadu_si128((const __m128i *)(s0 + i + 8)));
+            v0 = _mm_add_epi16(_mm_sub_epi16(v0, _mm_loadu_si128((const __m128i *)(s1 + i))),
+                               _mm_loadu_si128((const __m128i *)(a0 + i)));
+            v1 = _mm_add_epi16(_mm_sub_epi16(v1, _mm_loadu_si128((const __m128i *)(s1 + i + 8))),
+                               _mm_loadu_si128((const __m128i *)(a0 + i + 8)));
+            _mm_storeu_si128((__m128i *)(dst + i), v0);
+            _mm_storeu_si128((__m128i *)(dst + i + 8), v1);
+            if (dst2) {
+                _mm_storeu_si128((__m128i *)(dst2 + i), v0);
+                _mm_storeu_si128((__m128i *)(dst2 + i + 8), v1);
+            }
+        }
+        return;
+    }
     for (int i = 0; i < L1; i += 8) {
         __m128i v = _mm_loadu_si128((const __m128i *)(src + i));
         for (int k = 0; k < nSub; k++)
@@ -389,6 +632,7 @@ inline void accFusedRows(int16_t *dst, const int16_t *src,
         for (int k = 0; k < nAdd; k++)
             v = _mm_add_epi16(v, _mm_loadu_si128((const __m128i *)(add[k] + i)));
         _mm_storeu_si128((__m128i *)(dst + i), v);
+        if (dst2) _mm_storeu_si128((__m128i *)(dst2 + i), v);
     }
 }
 
@@ -396,6 +640,34 @@ inline void accFusedRows(int16_t *dst, const int16_t *src,
 
 // Android (the deployment target): 512 int16 = 8 lanes of 16B per op.
 // Wrapping vaddq/vsubq_s16 exactly match the scalar (int16_t) casts.
+// v1.4.28 (B3): register-passed fast forms (see the AVX-512 variant's
+// note) — bit-identical.
+inline void accFused1x1(int16_t *dst, const int16_t *src,
+                        const int16_t *s0, const int16_t *a0) {
+    for (int i = 0; i < L1; i += 16) {
+        int16x8_t v0 = vld1q_s16(src + i);
+        int16x8_t v1 = vld1q_s16(src + i + 8);
+        v0 = vaddq_s16(vsubq_s16(v0, vld1q_s16(s0 + i)), vld1q_s16(a0 + i));
+        v1 = vaddq_s16(vsubq_s16(v1, vld1q_s16(s0 + i + 8)), vld1q_s16(a0 + i + 8));
+        vst1q_s16(dst + i, v0);
+        vst1q_s16(dst + i + 8, v1);
+    }
+}
+
+inline void accFused2x1(int16_t *dst, const int16_t *src,
+                        const int16_t *s0, const int16_t *s1, const int16_t *a0) {
+    for (int i = 0; i < L1; i += 16) {
+        int16x8_t v0 = vld1q_s16(src + i);
+        int16x8_t v1 = vld1q_s16(src + i + 8);
+        v0 = vsubq_s16(v0, vld1q_s16(s0 + i));
+        v1 = vsubq_s16(v1, vld1q_s16(s0 + i + 8));
+        v0 = vaddq_s16(vsubq_s16(v0, vld1q_s16(s1 + i)), vld1q_s16(a0 + i));
+        v1 = vaddq_s16(vsubq_s16(v1, vld1q_s16(s1 + i + 8)), vld1q_s16(a0 + i + 8));
+        vst1q_s16(dst + i, v0);
+        vst1q_s16(dst + i + 8, v1);
+    }
+}
+
 inline void accAddRow(int16_t *dst, const int16_t *row) {
     for (int i = 0; i < L1; i += 8) {
         int16x8_t d = vld1q_s16(dst + i);
@@ -437,17 +709,70 @@ inline void accShiftPerspRows(int16_t *p, const int16_t *rF, const int16_t *rT) 
 
 inline void accFusedRows(int16_t *dst, const int16_t *src,
                          const int16_t *const *sub, int nSub,
-                         const int16_t *const *add, int nAdd) {
+                         const int16_t *const *add, int nAdd,
+                         int16_t *dst2 = nullptr) {
+    // v1.4.24 (L3): specialized 2x-unrolled fast paths for (1,1) quiets
+    // and (2,1) captures — see the AVX-512 variant's note. Bit-identical
+    // (wrapping vaddq/vsubq_s16 == the scalar int16_t casts).
+    if (nSub == 1 && nAdd == 1) {
+        const int16_t *s0 = sub[0];
+        const int16_t *a0 = add[0];
+        for (int i = 0; i < L1; i += 16) {
+            int16x8_t v0 = vld1q_s16(src + i);
+            int16x8_t v1 = vld1q_s16(src + i + 8);
+            v0 = vaddq_s16(vsubq_s16(v0, vld1q_s16(s0 + i)), vld1q_s16(a0 + i));
+            v1 = vaddq_s16(vsubq_s16(v1, vld1q_s16(s0 + i + 8)), vld1q_s16(a0 + i + 8));
+            vst1q_s16(dst + i, v0);
+            vst1q_s16(dst + i + 8, v1);
+            if (dst2) {
+                vst1q_s16(dst2 + i, v0);
+                vst1q_s16(dst2 + i + 8, v1);
+            }
+        }
+        return;
+    }
+    if (nSub == 2 && nAdd == 1) {
+        const int16_t *s0 = sub[0], *s1 = sub[1];
+        const int16_t *a0 = add[0];
+        for (int i = 0; i < L1; i += 16) {
+            int16x8_t v0 = vld1q_s16(src + i);
+            int16x8_t v1 = vld1q_s16(src + i + 8);
+            v0 = vsubq_s16(v0, vld1q_s16(s0 + i));
+            v1 = vsubq_s16(v1, vld1q_s16(s0 + i + 8));
+            v0 = vaddq_s16(vsubq_s16(v0, vld1q_s16(s1 + i)), vld1q_s16(a0 + i));
+            v1 = vaddq_s16(vsubq_s16(v1, vld1q_s16(s1 + i + 8)), vld1q_s16(a0 + i + 8));
+            vst1q_s16(dst + i, v0);
+            vst1q_s16(dst + i + 8, v1);
+            if (dst2) {
+                vst1q_s16(dst2 + i, v0);
+                vst1q_s16(dst2 + i + 8, v1);
+            }
+        }
+        return;
+    }
     for (int i = 0; i < L1; i += 8) {
         int16x8_t v = vld1q_s16(src + i);
         for (int k = 0; k < nSub; k++) v = vsubq_s16(v, vld1q_s16(sub[k] + i));
         for (int k = 0; k < nAdd; k++) v = vaddq_s16(v, vld1q_s16(add[k] + i));
         vst1q_s16(dst + i, v);
+        if (dst2) vst1q_s16(dst2 + i, v);
     }
 }
 
 #else
 // Portable scalar reference (bit-identical baseline).
+// v1.4.28 (B3): register-passed fast forms (see the AVX-512 variant's
+// note) — bit-identical.
+inline void accFused1x1(int16_t *dst, const int16_t *src,
+                        const int16_t *s0, const int16_t *a0) {
+    for (int i = 0; i < L1; i++) dst[i] = (int16_t)(src[i] - s0[i] + a0[i]);
+}
+
+inline void accFused2x1(int16_t *dst, const int16_t *src,
+                        const int16_t *s0, const int16_t *s1, const int16_t *a0) {
+    for (int i = 0; i < L1; i++) dst[i] = (int16_t)(src[i] - s0[i] - s1[i] + a0[i]);
+}
+
 inline void accAddRow(int16_t *dst, const int16_t *row) {
     for (int i = 0; i < L1; i++) dst[i] = (int16_t)(dst[i] + row[i]);
 }
@@ -470,12 +795,36 @@ inline void accShiftPerspRows(int16_t *p, const int16_t *rF, const int16_t *rT) 
 
 inline void accFusedRows(int16_t *dst, const int16_t *src,
                          const int16_t *const *sub, int nSub,
-                         const int16_t *const *add, int nAdd) {
+                         const int16_t *const *add, int nAdd,
+                         int16_t *dst2 = nullptr) {
+    // v1.4.24 (L3): pointer-hoisted fast paths for (1,1)/(2,1) (the
+    // scalar loop gains the hoisting even without unrolling).
+    if (nSub == 1 && nAdd == 1) {
+        const int16_t *s0 = sub[0];
+        const int16_t *a0 = add[0];
+        for (int i = 0; i < L1; i++) {
+            int16_t v = (int16_t)(src[i] - s0[i] + a0[i]);
+            dst[i] = v;
+            if (dst2) dst2[i] = v;
+        }
+        return;
+    }
+    if (nSub == 2 && nAdd == 1) {
+        const int16_t *s0 = sub[0], *s1 = sub[1];
+        const int16_t *a0 = add[0];
+        for (int i = 0; i < L1; i++) {
+            int16_t v = (int16_t)(src[i] - s0[i] - s1[i] + a0[i]);
+            dst[i] = v;
+            if (dst2) dst2[i] = v;
+        }
+        return;
+    }
     for (int i = 0; i < L1; i++) {
         int v = src[i];
         for (int k = 0; k < nSub; k++) v -= sub[k][i];
         for (int k = 0; k < nAdd; k++) v += add[k][i];
         dst[i] = (int16_t)v;
+        if (dst2) dst2[i] = (int16_t)v;
     }
 }
 
@@ -533,6 +882,15 @@ struct NnueOp {
 void applyMoveAcc(Accumulator &dst, const Accumulator &src, const StateInfo &si,
                   uint8_t &dirty);
 
+/** v1.4.26 (B3): reverse of applyMoveAcc for ONE perspective. Reconstructs
+ *  the parent ply's accumulator rows from the child's by applying the
+ *  recorded ops with add/sub swapped (the exact group inverse in modular
+ *  int16 arithmetic). Used by Position::nnueEnsureFresh to back-heal dirty
+ *  ancestor ring slots after a refreshPerspective at the current ply, so
+ *  sibling visits land on clean slots instead of re-refreshing. */
+void healMoveAcc(Accumulator &dst, const Accumulator &src, const StateInfo &si,
+                 int perspective);
+
 /** A piece appeared on sq: add its feature row to BOTH perspectives. */
 inline void accAdd(Accumulator &acc, int color, int type, int sq, int wKingSq,
                    int bKingSq) {
@@ -589,8 +947,20 @@ inline int bucketOf(int pieceCount) {
 /** Residual in centipawns from the SIDE TO MOVE's POV (quantized; the
  *  blendPct scaling is applied inside and the result clamped to +-600).
  *  v5.3: non-const — the call materializes any lazy king-bucket refresh
- *  first (this is the accumulator's only hot reader). */
+ *  first (this is the accumulator's only hot reader).
+ *  v1.4.27 (N2): implemented as blendScale(residualRaw(pos), bucket blend)
+ *  — the search caches the RAW value and applies this exact blend at the
+ *  use site, so residual() remains the value-identical reference form. */
 int residual(Position &pos);
+
+/** v1.4.27 (N2): the RAW residual — clamp(net output, -RES_CLAMP,
+ *  +RES_CLAMP), NO bucket blend. The blend is a pure function of
+ *  (raw, bucket pct), so caching the RAW value lets every consumer (leaf
+ *  stand-pat at the bucket blend, the static injection at staticBlendPct)
+ *  apply ONE correctly-rounded blend instead of un-scaling a previously
+ *  blended-and-rounded integer (the old double-rounding path).
+ *  v5.3 semantics inherited: materializes lazy refreshes first. */
+int residualRaw(Position &pos);
 
 /** True when the incremental accumulator equals a full refresh.
  *  v5.3: non-const — materializes lazy refreshes first. */

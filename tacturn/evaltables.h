@@ -204,12 +204,23 @@ extern int PST_MG[6][64];        // [piece][square], White POV
 extern int PST_EG[6][64];
 extern int PST_MG_BLACK[6][64];  // indexed with white-oriented sq: PST_*_BLACK[p][sq^56]
 extern int PST_EG_BLACK[6][64];
-extern int PHASE_WEIGHT[6];      // N=1 B=1 R=2 Q=4, max 24
 extern int PASSED_MG[8];         // (legacy accessors, kept in sync at init)
 extern int PASSED_EG[8];
-extern int KING_ATTACK_WEIGHT[6];
-extern int SAFETY[64];           // danger units -> centipawns (index clamped to 63)
-extern int MOBILITY_BASE[6];
+
+// v1.4.28 (B2): the constant (never tuner-written) lookup tables as inline
+// constexpr — the eval hot loops index them with loop-invariant pieces, so
+// every translation unit folds the loads at compile time instead of going
+// through the extern mutable globals (which also forced reloads around the
+// pawn-hash probe stores). Values identical to the old definitions.
+inline constexpr int PHASE_WEIGHT[6] = {0, 1, 1, 2, 4, 0};  // N=1 B=1 R=2 Q=4, max 24
+inline constexpr int KING_ATTACK_WEIGHT[6] = {0, 2, 2, 3, 5, 0};
+inline constexpr int SAFETY[64] = {
+    0, 0, 1, 2, 3, 5, 7, 9, 12, 15, 18, 22, 26, 30, 35, 39,
+    44, 50, 56, 61, 68, 75, 83, 91, 100, 110, 120, 131, 142, 154, 167, 180,
+    195, 211, 227, 244, 263, 282, 302, 324, 346, 370, 395, 421, 448, 476, 506, 537,
+    569, 603, 639, 676, 715, 755, 797, 841, 887, 935, 985, 1037, 1091, 1147, 1205, 1265
+};
+inline constexpr int MOBILITY_BASE[6] = {0, 4, 6, 7, 13, 0};
 
 void initEvalTables();
 

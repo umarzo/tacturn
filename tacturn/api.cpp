@@ -187,6 +187,11 @@ void tacturn_think(TacHandle h, const TacSearchLimits *limits, TacIterationCallb
     lim.adaptiveTime = limits->adaptiveTime != 0;
     lim.depthFloor = limits->depthFloor;
     lim.lastScore = limits->lastScore;
+    lim.trackLastScore = true;  // v1.4.27 (T3b): JNI play path — the
+                                // engine's own per-side record fills the
+                                // -33000 sentinel (host harness callers
+                                // leave this false: they track lastScore
+                                // themselves and reset on ucinewgame).
     lim.jitterCp = limits->jitterCp;
     lim.contemptCp = limits->contemptCp;
     lim.threads = limits->threads;

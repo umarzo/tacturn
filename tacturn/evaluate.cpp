@@ -51,6 +51,18 @@ namespace tacturn {
 
 bool evalPawnHashDisabled = false;
 
+// v1.4.27 (Prev-B1): the shipped parameter tables as COMPILE-TIME
+// constants. The non-trace TADD below reads TUNED_EV_* (immutable
+// .rodata, internal linkage) instead of the extern-mutable EV_MG/EV_EG
+// globals: the compiler can then hoist/CSE the weight loads out of the
+// eval loops (any store through an unknown pointer — e.g. the pawn-hash
+// probe — forces an EV_* reload per iteration). Value-identical to the
+// shipped EV_* contents: initEvalTables() copies TUNED_EV_* verbatim and
+// nothing writes EV_* afterwards (the tuner uses the Trace=true path).
+#if __has_include("eval_tuned.h")
+#include "eval_tuned.h"
+#endif
+
 // Conversion-potential ("complexity") adjustment strength, in percent of the
 // reference values (tuned for ~3300-Elo engines; lower engines convert less
 // reliably, so the default dilutes the drawish damping).
@@ -70,19 +82,80 @@ inline int chebyshev(int a, int b) {
 
 inline int clampI2(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-/** Add a parameterised term (white-POV amount; black terms pass negative). */
+// v1.4.28 (B2): king Chebyshev-distance ring masks, precomputed as a
+// constexpr table. le3[sq] / le5[sq] hold the squares within Chebyshev
+// distance 3 / 5 of sq. The knight-Siberia loops used to call chebyshev()
+// twice per knight (to both kings) with three conditional branches each;
+// the whole-bitboard form masks the knight set against the two kings'
+// combined rings instead. NOT in (le5(wk) | le5(bk)) means both distances
+// are >= 6 (min >= 6 -> SIBERIA2); in the le5-union but not the le3-union
+// means min distance is 4..5 (SIBERIA). Same predicate, one lookup/king.
+struct KingRingTable {
+    Bitboard le3[64];
+    Bitboard le5[64];
+    constexpr KingRingTable() : le3{}, le5{} {
+        for (int sq = 0; sq < 64; sq++) {
+            for (int d = 0; d < 64; d++) {
+                int dr = (d >> 3) - (sq >> 3);
+                int df = (d & 7) - (sq & 7);
+                if (dr < 0) dr = -dr;
+                if (df < 0) df = -df;
+                int cd = dr > df ? dr : df;
+                if (cd <= 3) le3[sq] |= 1ULL << d;
+                if (cd <= 5) le5[sq] |= 1ULL << d;
+            }
+        }
+    }
+};
+constexpr KingRingTable kKingRings{};
+
+/** Add a parameterised term (white-POV amount; black terms pass negative).
+ *  v1.4.24 (L6): the tuner branches are now COMPILE-TIME — evaluateImpl /
+ *  pawnStructure / kingPositionTerms are templates on <bool Trace>, so the
+ *  ~142 TADD sites emit zero runtime `if (tr)` tests in the shipped
+ *  non-trace instantiation (the old form paid a never-taken branch per
+ *  term on every evaluation). In the Trace instantiation the historical
+ *  runtime null check is kept (a Trace=true call with tr == nullptr can
+ *  still arrive via the pawn-cache path), so behavior is unchanged for
+ *  the tuner too.
+ *  v1.4.27 (Prev-B1): in the shipped non-trace build TADD reads the
+ *  constexpr TUNED_EV_MG/TUNED_EV_EG tables instead of the mutable
+ *  EV_MG/EV_EG arrays - immutable, internally-linked .rodata the
+ *  optimizer may freely hoist, and zero-weight features fold away.
+ *  Bit-exact: EV_* == TUNED_EV_* at every gameplay read. */
+#ifdef TACTURN_TUNED_EVAL
 #define TADD(feat, amt)                                                      \
     do {                                                                     \
         const int a_ = (amt);                                                \
-        mgScore += EV_MG[feat] * a_;                                          \
-        egScore += EV_EG[feat] * a_;                                          \
-        if (tr) {                                                            \
-            tr->mgAmt[feat] += a_;                                            \
-            tr->egAmt[feat] += a_;                                            \
+        if constexpr (Trace) {                                               \
+            mgScore += EV_MG[feat] * a_;                                     \
+            egScore += EV_EG[feat] * a_;                                     \
+            if (tr) {                                                        \
+                tr->mgAmt[feat] += a_;                                       \
+                tr->egAmt[feat] += a_;                                       \
+            }                                                                \
+        } else {                                                             \
+            mgScore += TUNED_EV_MG[feat] * a_;                               \
+            egScore += TUNED_EV_EG[feat] * a_;                               \
         }                                                                    \
     } while (0)
+#else
+#define TADD(feat, amt)                                                      \
+    do {                                                                     \
+        const int a_ = (amt);                                                \
+        mgScore += EV_MG[feat] * a_;                                         \
+        egScore += EV_EG[feat] * a_;                                         \
+        if constexpr (Trace) {                                               \
+            if (tr) {                                                        \
+                tr->mgAmt[feat] += a_;                                       \
+                tr->egAmt[feat] += a_;                                       \
+            }                                                                \
+        }                                                                    \
+    } while (0)
+#endif
 
 /** Cached pawn-structure evaluation. Amounts go to the trace when asked. */
+template <bool Trace>
 void pawnStructure(Bitboard wp, Bitboard bp, PawnEntry &e, EvalTrace *tr) {
     int mgScore = 0, egScore = 0;
 
@@ -226,7 +299,56 @@ void pawnStructure(Bitboard wp, Bitboard bp, PawnEntry &e, EvalTrace *tr) {
             int bc = popcount(e.bPass & FILES_BB[f]);
             if (bc > 1) TADD(F_PASSED_STACKED, -(bc - 1));
         }
+
+        // v1.4.27 (Prev-B1): connected passers — a pure (wp, bp) term via
+        // the passer sets, moved here from evaluateImpl so the pawn hash
+        // caches it (computed on the ~6.5% misses instead of 100% of HCE
+        // evaluations). Same support shift set, same popcount, same sign.
+        if (e.wPass) {
+            Bitboard support = ((e.wPass << 7) & NOT_FILE_H_BB) |
+                               ((e.wPass << 9) & NOT_FILE_A_BB) |
+                               ((e.wPass >> 7) & NOT_FILE_A_BB) |
+                               ((e.wPass >> 9) & NOT_FILE_H_BB);
+            int cnt = popcount(support & e.wPass);
+            if (cnt > 0) TADD(F_PASSED_CONN, cnt);
+        }
+        if (e.bPass) {
+            Bitboard support = ((e.bPass << 7) & NOT_FILE_H_BB) |
+                               ((e.bPass << 9) & NOT_FILE_A_BB) |
+                               ((e.bPass >> 7) & NOT_FILE_A_BB) |
+                               ((e.bPass >> 9) & NOT_FILE_H_BB);
+            int cnt = popcount(support & e.bPass);
+            if (cnt > 0) TADD(F_PASSED_CONN, -cnt);
+        }
+
+        // v1.4.27 (Prev-B1): weak pawns — pure (wp, bp): attacked by an
+        // enemy pawn, not defended by own pawns. The local wDef/bDef sets
+        // ARE the pawn-attack sets evaluateImpl uses (identical shift
+        // forms), so the popcounts carry over verbatim.
+        {
+            int cnt = popcount(wp & bDef & ~wDef);
+            if (cnt) TADD(F_WEAK_PAWN, cnt);
+            cnt = popcount(bp & wDef & ~bDef);
+            if (cnt) TADD(F_WEAK_PAWN, -cnt);
+        }
         (void)allPawns;
+    }
+
+    // v1.4.27 (Prev-B1): the closedness INDEX is a pure (wp, bp) function
+    // (south-fill open-file count + rammed-pawn formula) — cache it in the
+    // entry; the live closedness section in evaluateImpl just reads the
+    // byte and multiplies by the live knight/rook counts. The shifted
+    // rammed form is exactly evaluateImpl's wRammed.
+    {
+        int pawnCount = popcount(wp | bp);
+        int rammedCount = popcount(wp & (bp >> 8));
+        Bitboard ofb = wp | bp;
+        ofb |= ofb >> 8;
+        ofb |= ofb >> 16;
+        ofb |= ofb >> 32;
+        int openFiles = 8 - popcount(ofb & 0xFF);
+        int closedness = (pawnCount + 3 * rammedCount - 4 * openFiles) / 3;
+        e.closedIdx = (uint8_t)clampI2(closedness, 0, 8);
     }
 
     e.mg = mgScore;
@@ -262,7 +384,9 @@ inline Bitboard attackedTwice(Bitboard a, Bitboard b, Bitboard c, Bitboard d, Bi
  *  passed mg/eg references exactly as the inline TADDs did; when the tuner
  *  traces, the amounts emit from here on every call (the cache is bypassed
  *  whenever a trace is requested). */
-void kingPositionTerms(Bitboard wp, Bitboard bp, int wk, int bk, bool shelterOn,
+template <bool Trace>
+void kingPositionTerms(Bitboard wp, Bitboard bp, Bitboard wPass, Bitboard bPass,
+                       int wk, int bk, bool shelterOn,
                        int &mgScore, int &egScore, EvalTrace *tr) {
     // ---- King shelter (midgame; per-file distance x pawn-rank table) ----
     // ---- + pawn storm ----
@@ -401,17 +525,67 @@ void kingPositionTerms(Bitboard wp, Bitboard bp, int wk, int bk, bool shelterOn,
         if (((wp | bp) & FILES_BB[wk & 7]) == 0) TADD(F_KING_OPEN_FILE, 1);
         if (((wp | bp) & FILES_BB[bk & 7]) == 0) TADD(F_KING_OPEN_FILE, -1);
     }
+
+    // ---- v1.4.27 (Prev-B1): king-proximity passer terms ----
+    // Moved verbatim from evaluateImpl's passed-pawn block: they depend
+    // only on (passers, wk, bk) = (wp, bp, wk, bk) — pure inputs of this
+    // cached function — so they ride the (pawnKey, wk, bk, gate) cache.
+    // Same chebyshev promotion-square distances, same 5-clamp, same signs;
+    // the terms apply at EVERY phase (they do not read shelterOn, so both
+    // gate values of the cache key carry them identically).
+    if (wPass | bPass) {
+        Bitboard bb = wPass;
+        while (bb) {
+            int sq = lsb(bb);
+            bb &= bb - 1;
+            int promo = (sq & 7) + 56;
+            int wd = chebyshev(wk, promo);
+            int bd = chebyshev(bk, promo);
+            if (wd > 5) wd = 5;
+            if (bd > 5) bd = 5;
+            TADD(F_PASSED_KING_OWN, 5 - wd);
+            TADD(F_PASSED_KING_ENEMY, -(5 - bd));
+        }
+        bb = bPass;
+        while (bb) {
+            int sq = lsb(bb);
+            bb &= bb - 1;
+            int promo = (sq & 7);
+            int bd = chebyshev(bk, promo);
+            int wd = chebyshev(wk, promo);
+            if (bd > 5) bd = 5;
+            if (wd > 5) wd = 5;
+            TADD(F_PASSED_KING_OWN, -(5 - bd));
+            TADD(F_PASSED_KING_ENEMY, 5 - wd);
+        }
+    }
 }
 
 }  // namespace
 
+// v1.4.24 (L6): evaluate() is now a thin dispatcher — the whole term sweep
+// lives in evaluateImpl<bool Trace>, so the shipped (trace == nullptr)
+// instantiation compiles with zero runtime tuner branches (see TADD). The
+// tuner's Trace=true instantiation keeps the old runtime logic verbatim.
+namespace {
+template <bool Trace>
+int evaluateImpl(const Position &b, PawnHashTable &pawnHash, EvalTrace *tr);
+}
+
 int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
-    EvalTrace *tr = trace;
-    if (tr) {
+    if (trace) return evaluateImpl<true>(b, pawnHash, trace);
+    return evaluateImpl<false>(b, pawnHash, nullptr);
+}
+
+namespace {
+template <bool Trace>
+int evaluateImpl(const Position &b, PawnHashTable &pawnHash, EvalTrace *tr) {
+    if constexpr (Trace) {
         memset(tr->mgAmt, 0, sizeof(tr->mgAmt));
         memset(tr->egAmt, 0, sizeof(tr->egAmt));
         tr->scaled = false;
     }
+    (void)tr;
 
     // Fast path: bare kings / single minors — hopeless for either side.
     if ((b.pieceBb[PAWN] | b.pieceBb[ROOK] | b.pieceBb[QUEEN]) == 0) {
@@ -464,11 +638,16 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         fresh.wPass = 0;
         fresh.bPass = 0;
         EvalTrace *ptr = evalPawnHashDisabled ? tr : nullptr;
-        pawnStructure(wp, bp, fresh, ptr);
+        pawnStructure<Trace>(wp, bp, fresh, ptr);
         pe->mg = fresh.mg;
         pe->eg = fresh.eg;
         pe->wPass = fresh.wPass;
         pe->bPass = fresh.bPass;
+        // v1.4.27 (Prev-B1): the closedness index rides the entry too —
+        // WITHOUT this copy a hit would read a stale index from whatever
+        // pawn structure previously owned this slot (caught by the bench
+        // node-count fingerprint: 165,888/1,361,920 must not move).
+        pe->closedIdx = fresh.closedIdx;
         pe->key = b.pawnKey;
         mgScore += pe->mg;
         egScore += pe->eg;
@@ -484,10 +663,46 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
     Bitboard bPawnAtt2 = ((bp >> 9) & NOT_FILE_H_BB) & ((bp >> 7) & NOT_FILE_A_BB);
     Bitboard allPawns = wp | bp;
     // Pawns blocked by any pawn; pawns rammed by an ENEMY pawn.
-    Bitboard wBlocked = ((wp << 8) & allPawns) >> 8;
-    Bitboard bBlocked = ((bp >> 8) & allPawns) << 8;
-    Bitboard wRammed = ((wp << 8) & bp) >> 8;
-    Bitboard bRammed = ((bp >> 8) & wp) << 8;
+    // v1.4.27 (B3): the shift-and-mask pairs collapse to a single intersect
+    // with the pre-shifted operand — ((wp << 8) & allPawns) >> 8 selects
+    // exactly { sq : sq in wp and sq+8 in allPawns } (the double shift
+    // cancels; edge bits shift out identically on both forms), which is
+    // wp & (allPawns >> 8). Same for the other three. 8 ops -> 4.
+    Bitboard wBlocked = wp & (allPawns >> 8);
+    Bitboard bBlocked = bp & (allPawns << 8);
+    Bitboard wRammed = wp & (bp >> 8);
+    Bitboard bRammed = bp & (wp << 8);
+
+    // ---- v1.4.27 (Prev-B1): outposts + behind-pawn terms as whole-bitboard
+    // popcounts (were per-piece branchy tests inside the 4 mobility loops).
+    // An outpost square: rank 3-5 own-POV, defended by an own pawn
+    // (own pawn-attack set), beyond enemy pawn reach (~enemy pawn-attack
+    // set) — the exact per-piece predicate as one mask. Behind-pawn: a
+    // piece with any pawn directly behind it (allPawns shifted one rank);
+    // the shifted board's empty rank-0/7 tail reproduces the old sq>=8 /
+    // sq<=55 guards bit-for-bit.
+    {
+        constexpr Bitboard W_OUTPOST_RANKS = 0x0000FFFFFF000000ULL;  // ranks 3-5
+        constexpr Bitboard B_OUTPOST_RANKS = 0x0000FFFFFF0000ULL;  // ranks 2-4 (bits 16-39)
+        Bitboard wOutpost = W_OUTPOST_RANKS & wPawnAtt & ~bPawnAtt;
+        Bitboard bOutpost = B_OUTPOST_RANKS & bPawnAtt & ~wPawnAtt;
+        int cnt = popcount(b.pieceBb[KNIGHT] & white & wOutpost);
+        if (cnt) TADD(F_OUTPOST_KNIGHT, cnt);
+        cnt = popcount(b.pieceBb[BISHOP] & white & wOutpost);
+        if (cnt) TADD(F_OUTPOST_BISHOP, cnt);
+        cnt = popcount(b.pieceBb[KNIGHT] & black & bOutpost);
+        if (cnt) TADD(F_OUTPOST_KNIGHT, -cnt);
+        cnt = popcount(b.pieceBb[BISHOP] & black & bOutpost);
+        if (cnt) TADD(F_OUTPOST_BISHOP, -cnt);
+        cnt = popcount(b.pieceBb[KNIGHT] & white & (allPawns << 8));
+        if (cnt) TADD(F_KNIGHT_BEHIND_PAWN, cnt);
+        cnt = popcount(b.pieceBb[BISHOP] & white & (allPawns << 8));
+        if (cnt) TADD(F_BISHOP_BEHIND_PAWN, cnt);
+        cnt = popcount(b.pieceBb[KNIGHT] & black & (allPawns >> 8));
+        if (cnt) TADD(F_KNIGHT_BEHIND_PAWN, -cnt);
+        cnt = popcount(b.pieceBb[BISHOP] & black & (allPawns >> 8));
+        if (cnt) TADD(F_BISHOP_BEHIND_PAWN, -cnt);
+    }
 
     // Mobility areas: enemy pawn control, own king square and own blocked
     // pawns do not count as real mobility (Ethereal-style).
@@ -497,6 +712,12 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
     // King zones: the king box plus one rank pushed toward the enemy.
     Bitboard wkZone = KING_ATT[wk] | (KING_ATT[wk] << 8);
     Bitboard bkZone = KING_ATT[bk] | (KING_ATT[bk] >> 8);
+    // v1.4.27 (B3): the piece loops below all intersect the SAME two
+    // composites (king zone minus the squares double-attacked by the
+    // zone's owner's pawns). Hoisted once — 16 bitwise ops per evaluation
+    // and 8 register-local recomputes across the 8 piece loops gone.
+    Bitboard wkTargetZone = wkZone & ~wPawnAtt2;
+    Bitboard bkTargetZone = bkZone & ~bPawnAtt2;
 
     // X-ray occupancy: bishops see through own B/Q, rooks through own R/Q.
     Bitboard occNoWB = occ ^ (white & (b.pieceBb[BISHOP] | b.pieceBb[QUEEN]));
@@ -505,20 +726,30 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
     Bitboard occNoBR = occ ^ (black & (b.pieceBb[ROOK] | b.pieceBb[QUEEN]));
     // The four centre squares (d4, e4, d5, e5).
     Bitboard CENTER_SQ = bitOf(27) | bitOf(28) | bitOf(35) | bitOf(36);
+    // v1.4.27 (B3): both long diagonals (a1-h8: f == r, a8-h1: f + r == 7)
+    // minus the four centre squares, as one constant — the bishop
+    // long-diagonal test reduces to (bitOf(sq) & LONG_DIAG_NONCENTER).
+    constexpr Bitboard LONG_DIAG_NONCENTER = 0x8142240000244281ULL;
+
+    // ---- Piece counts (v1.4.24 L6: hoisted to function scope) ----
+    // Ten popcounts computed ONCE and reused by the imbalance terms, the
+    // bishop-pair gate, the space gate, the closedness terms, the king-
+    // danger queen flags and the simplification term (the old code
+    // recomputed subsets of these five times). Identical values.
+    int wNc = popcount(b.pieceBb[KNIGHT] & white);
+    int bNc = popcount(b.pieceBb[KNIGHT] & black);
+    int wBc = popcount(b.pieceBb[BISHOP] & white);
+    int bBc = popcount(b.pieceBb[BISHOP] & black);
+    int wRc = popcount(b.pieceBb[ROOK] & white);
+    int bRc = popcount(b.pieceBb[ROOK] & black);
+    int wQc = popcount(b.pieceBb[QUEEN] & white);
+    int bQc = popcount(b.pieceBb[QUEEN] & black);
+    int wPc = popcount(wp), bPc = popcount(bp);
 
     // ---- Material imbalance (v3.1: piece-count interactions the linear
     // PST material model cannot express; SF-inspired). Defaults 0 keep
     // the eval bit-identical to v3.0.0. ----
     {
-        int wNc = popcount(b.pieceBb[KNIGHT] & white);
-        int bNc = popcount(b.pieceBb[KNIGHT] & black);
-        int wBc = popcount(b.pieceBb[BISHOP] & white);
-        int bBc = popcount(b.pieceBb[BISHOP] & black);
-        int wRc = popcount(b.pieceBb[ROOK] & white);
-        int bRc = popcount(b.pieceBb[ROOK] & black);
-        int wQc = popcount(b.pieceBb[QUEEN] & white);
-        int bQc = popcount(b.pieceBb[QUEEN] & black);
-        int wPc = popcount(wp), bPc = popcount(bp);
         int avgP = (wPc + bPc + 1) / 2;
         TADD(F_IMB_QUEEN_PAWNS, (wQc - bQc) * avgP);
         TADD(F_IMB_ROOK_PAWNS, (wRc - bRc) * avgP);
@@ -535,142 +766,40 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
              (wNc * (bPc - wPc) - bNc * (wPc - bPc)) / 2);
     }
 
-    // ---- Bishop pair + bad bishop + rammed + behind pawn ----
-    if (popcount(b.pieceBb[BISHOP] & white) >= 2) TADD(F_BISHOP_PAIR, 1);
-    if (popcount(b.pieceBb[BISHOP] & black) >= 2) TADD(F_BISHOP_PAIR, -1);
-    {
-        Bitboard wB = b.pieceBb[BISHOP] & white;
-        while (wB) {
-            int sq = lsb(wB);
-            wB &= wB - 1;
-            int cnt = popcount(wp & colorSquaresOf(sq));
-            if (cnt) TADD(F_BAD_BISHOP, cnt);
-            cnt = popcount(wRammed & colorSquaresOf(sq));
-            if (cnt) TADD(F_BISHOP_RAMMED, cnt);
-            // Bishop behind (one square below) any pawn.
-            if (sq >= 8 && (allPawns & bitOf(sq - 8))) TADD(F_BISHOP_BEHIND_PAWN, 1);
-        }
-        Bitboard bB = b.pieceBb[BISHOP] & black;
-        while (bB) {
-            int sq = lsb(bB);
-            bB &= bB - 1;
-            int cnt = popcount(bp & colorSquaresOf(sq));
-            if (cnt) TADD(F_BAD_BISHOP, -cnt);
-            cnt = popcount(bRammed & colorSquaresOf(sq));
-            if (cnt) TADD(F_BISHOP_RAMMED, -cnt);
-            if (sq <= 55 && (allPawns & bitOf(sq + 8))) TADD(F_BISHOP_BEHIND_PAWN, -1);
-        }
-    }
+    // ---- Bishop pair (v1.4.25 B4: the per-bishop structural terms ----
+    // ---- F_BAD_BISHOP / F_BISHOP_RAMMED / F_BISHOP_BEHIND_PAWN were ----
+    // ---- fused into the bishop mobility loops below — same iteration ----
+    // ---- set, additive TADD accumulators, identical scores/trace.) ----
+    // (v1.4.24 L6: bishop-pair gate reads the hoisted counts.)
+    if (wBc >= 2) TADD(F_BISHOP_PAIR, 1);
+    if (bBc >= 2) TADD(F_BISHOP_PAIR, -1);
 
     // ---- Passed-pawn terms (king proximity, connected, blocked) ----
-    {
-        Bitboard bb = wPassers;
-        while (bb) {
-            int sq = lsb(bb);
-            bb &= bb - 1;
-            int promo = (sq & 7) + 56;
-            int wd = chebyshev(wk, promo);
-            int bd = chebyshev(bk, promo);
-            if (wd > 5) wd = 5;
-            if (bd > 5) bd = 5;
-            TADD(F_PASSED_KING_OWN, 5 - wd);
-            TADD(F_PASSED_KING_ENEMY, -(5 - bd));
-            // Clean promotion path is checked later, once the attack maps
-            // are available (see the threats section).
-        }
-        bb = bPassers;
-        while (bb) {
-            int sq = lsb(bb);
-            bb &= bb - 1;
-            int promo = (sq & 7);
-            int bd = chebyshev(bk, promo);
-            int wd = chebyshev(wk, promo);
-            if (bd > 5) bd = 5;
-            if (wd > 5) wd = 5;
-            TADD(F_PASSED_KING_OWN, -(5 - bd));
-            TADD(F_PASSED_KING_ENEMY, 5 - wd);
-        }
-        // Connected passers: passers defending / standing next to each other.
-        if (wPassers) {
-            Bitboard support = ((wPassers << 7) & NOT_FILE_H_BB) |
-                               ((wPassers << 9) & NOT_FILE_A_BB) |
-                               ((wPassers >> 7) & NOT_FILE_A_BB) |
-                               ((wPassers >> 9) & NOT_FILE_H_BB);
-            int cnt = popcount(support & wPassers);
-            if (cnt > 0) TADD(F_PASSED_CONN, cnt);
-        }
-        if (bPassers) {
-            Bitboard support = ((bPassers << 7) & NOT_FILE_H_BB) |
-                               ((bPassers << 9) & NOT_FILE_A_BB) |
-                               ((bPassers >> 7) & NOT_FILE_A_BB) |
-                               ((bPassers >> 9) & NOT_FILE_H_BB);
-            int cnt = popcount(support & bPassers);
-            if (cnt > 0) TADD(F_PASSED_CONN, -cnt);
-        }
-        // Blocked passers.
-        bb = wPassers;
-        while (bb) {
-            int sq = lsb(bb);
-            bb &= bb - 1;
-            if ((sq >> 3) < 7 && (occ & bitOf(sq + 8))) TADD(F_PASSED_BLOCKED, 1);
-        }
-        bb = bPassers;
-        while (bb) {
-            int sq = lsb(bb);
-            bb &= bb - 1;
-            if ((sq >> 3) > 0 && (occ & bitOf(sq - 8))) TADD(F_PASSED_BLOCKED, -1);
+    // v1.4.25 (B4): gated on (wPassers | bPassers) — with no passed pawns
+    // every loop below is a no-op. The two F_PASSED_BLOCKED while loops
+    // are replaced by popcounts over the shifted passer sets (the shift
+    // drops rank-7/rank-0 passers exactly like the old rank guards).
+    if (wPassers | bPassers) {
+        // v1.4.27 (Prev-B1): F_PASSED_KING_OWN/ENEMY moved into
+        // kingPositionTerms (pure (wp, bp, wk, bk), cached by the pawn
+        // entry's king key) and F_PASSED_CONN moved into pawnStructure
+        // (pure (wp, bp), cached by pawnKey). F_PASSED_BLOCKED needs the
+        // full occupancy, so it stays live.
+        // Blocked passers (v1.4.25 B4: O(1) popcount form — the << 8 / >> 8
+        // drops the promotion-rank passers exactly like the old guards).
+        {
+            int cnt = popcount((wPassers << 8) & occ);
+            if (cnt) TADD(F_PASSED_BLOCKED, cnt);
+            cnt = popcount((bPassers >> 8) & occ);
+            if (cnt) TADD(F_PASSED_BLOCKED, -cnt);
         }
     }
 
     // ---- Rooks on open / semi-open files, the 7th, behind passers ----
-    {
-        Bitboard rooks = b.pieceBb[ROOK] & white;
-        while (rooks) {
-            int sq = lsb(rooks);
-            rooks &= rooks - 1;
-            Bitboard fileBb = FILES_BB[sq & 7];
-            if ((wp & fileBb) == 0) {
-                if ((bp & fileBb) == 0) TADD(F_ROOK_OPEN, 1);
-                else TADD(F_ROOK_SEMI, 1);
-            }
-            if ((sq >> 3) == 6 && (bp & RANKS_BB[6]) != 0) TADD(F_ROOK_7TH, 1);
-
-            if (wPassers & fileBb) {
-                Bitboard passersOnFile = wPassers & fileBb;
-                while (passersOnFile) {
-                    int p = lsb(passersOnFile);
-                    passersOnFile &= passersOnFile - 1;
-                    if ((p >> 3) > (sq >> 3)) {
-                        TADD(F_ROOK_BEHIND_PASSER, 1);
-                        break;
-                    }
-                }
-            }
-        }
-        rooks = b.pieceBb[ROOK] & black;
-        while (rooks) {
-            int sq = lsb(rooks);
-            rooks &= rooks - 1;
-            Bitboard fileBb = FILES_BB[sq & 7];
-            if ((bp & fileBb) == 0) {
-                if ((wp & fileBb) == 0) TADD(F_ROOK_OPEN, -1);
-                else TADD(F_ROOK_SEMI, -1);
-            }
-            if ((sq >> 3) == 1 && (wp & RANKS_BB[1]) != 0) TADD(F_ROOK_7TH, -1);
-
-            if (bPassers & fileBb) {
-                Bitboard passersOnFile = bPassers & fileBb;
-                while (passersOnFile) {
-                    int p = lsb(passersOnFile);
-                    passersOnFile &= passersOnFile - 1;
-                    if ((p >> 3) < (sq >> 3)) {
-                        TADD(F_ROOK_BEHIND_PASSER, -1);
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    // (v1.4.25 B4: fused into the rook mobility loops below — same
+    // iteration set, additive TADD accumulators; the inner
+    // while (passersOnFile) scan became the O(1) ~RANKS_LE / ~RANKS_GE
+    // mask test.)
 
     // ---- King defenders (live: knight/bishop placement) + king-position
     // terms (cached in the pawn hash entry) ----
@@ -696,8 +825,12 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
     }
     {
         bool shelterOn = phase > 6;
-        if (pawnHit && pe->kingValid && pe->wkSq == (uint8_t)wk &&
-            pe->bkSq == (uint8_t)bk && pe->kingGate == (uint8_t)shelterOn) {
+        // v1.4.27 (Prev-B1): kingValid+kingGate merged into kingFlags —
+        // bit0 valid, bit1 gate; 0 (never valid) can never equal 1|gate,
+        // so the single compare carries both the validity and gate tests.
+        const uint8_t wantKF = (uint8_t)(1u | (shelterOn ? 2u : 0u));
+        if (pawnHit && pe->kingFlags == wantKF && pe->wkSq == (uint8_t)wk &&
+            pe->bkSq == (uint8_t)bk) {
             mgScore += pe->kpMg;
             egScore += pe->kpEg;
         } else {
@@ -705,13 +838,13 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
             // (A trace request always recomputes: the tuner must see every
             // feature amount, so the cache is bypassed exactly when the
             // pawn cache is.)
-            kingPositionTerms(wp, bp, wk, bk, shelterOn, kmg, keg, tr);
+            kingPositionTerms<Trace>(wp, bp, wPassers, bPassers, wk, bk, shelterOn,
+                                     kmg, keg, tr);
             pe->wkSq = (uint8_t)wk;
             pe->bkSq = (uint8_t)bk;
-            pe->kingGate = (uint8_t)shelterOn;
+            pe->kingFlags = wantKF;
             pe->kpMg = (int16_t)kmg;
             pe->kpEg = (int16_t)keg;
-            pe->kingValid = true;
             mgScore += kmg;
             egScore += keg;
         }
@@ -744,24 +877,17 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         wKnightAtt |= att;
         int safe = popcount(att & wMobArea);
         TADD(F_MOB_N0 + safe, 1);  // per-count mobility table
-        int zoneHits = popcount(att & bkZone & ~bPawnAtt2);
-        if (zoneHits > 0) {
+        if (Bitboard zh = att & bkTargetZone) {
             wAttackers++;
-            wDanger += KING_ATTACK_WEIGHT[KNIGHT] + zoneHits / 2;
+            wDanger += KING_ATTACK_WEIGHT[KNIGHT] + popcount(zh) / 2;
         }
-        // Knight outposts: rank 4-6, pawn-protected, beyond enemy pawn reach.
-        if ((sq >> 3) >= 3 && (sq >> 3) <= 5 && (wp & PAWN_ATT[BLACK][sq]) != 0 &&
-            (bp & PAWN_ATT[WHITE][sq]) == 0) {
-            TADD(F_OUTPOST_KNIGHT, 1);
-        }
-        // Knight behind a pawn (supporting its advance).
-        if (sq >= 8 && (allPawns & bitOf(sq - 8))) TADD(F_KNIGHT_BEHIND_PAWN, 1);
-        // Knight far from both kings (Siberia).
-        int kd = chebyshev(sq, wk);
-        int kd2 = chebyshev(sq, bk);
-        if (kd2 < kd) kd = kd2;
-        if (kd == 4 || kd == 5) TADD(F_KNIGHT_SIBERIA, 1);
-        else if (kd >= 6) TADD(F_KNIGHT_SIBERIA2, 1);
+        // v1.4.27 (Prev-B1): the outpost + behind-pawn tests moved to the
+        // whole-bitboard terms above the mobility loops.
+        // v1.4.28 (B2): Siberia — hoisted whole-bitboard popcounts below.
+        // (The white knight Siberia counts run once after the black loop,
+        // together with black's — both use only the piece bitboards.)
+    }
+    while (0) {  // v1.4.28 (B2): (removed — Siberia hoisted below the loops)
     }
     kn = b.pieceBb[KNIGHT] & black;
     while (kn) {
@@ -771,21 +897,29 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         bKnightAtt |= att;
         int safe = popcount(att & bMobArea);
         TADD(F_MOB_N0 + safe, -1);
-        int zoneHits = popcount(att & wkZone & ~wPawnAtt2);
-        if (zoneHits > 0) {
+        if (Bitboard zh = att & wkTargetZone) {
             bAttackers++;
-            bDanger += KING_ATTACK_WEIGHT[KNIGHT] + zoneHits / 2;
+            bDanger += KING_ATTACK_WEIGHT[KNIGHT] + popcount(zh) / 2;
         }
-        if ((7 - (sq >> 3)) >= 3 && (7 - (sq >> 3)) <= 5 &&
-            (bp & PAWN_ATT[WHITE][sq]) != 0 && (wp & PAWN_ATT[BLACK][sq]) == 0) {
-            TADD(F_OUTPOST_KNIGHT, -1);
-        }
-        if (sq <= 55 && (allPawns & bitOf(sq + 8))) TADD(F_KNIGHT_BEHIND_PAWN, -1);
-        int kd = chebyshev(sq, wk);
-        int kd2 = chebyshev(sq, bk);
-        if (kd2 < kd) kd = kd2;
-        if (kd == 4 || kd == 5) TADD(F_KNIGHT_SIBERIA, -1);
-        else if (kd >= 6) TADD(F_KNIGHT_SIBERIA2, -1);
+        // v1.4.28 (B2): Siberia — hoisted whole-bitboard popcounts below.
+    }
+    {
+        // v1.4.28 (B2): hoisted knight-Siberia (white) — same min-distance
+        // bucketing as the old per-knight chebyshev pair, one popcount.
+        Bitboard sib = b.pieceBb[KNIGHT] & white;
+        int cnt = popcount(sib & ~(kKingRings.le5[wk] | kKingRings.le5[bk]));
+        if (cnt) TADD(F_KNIGHT_SIBERIA2, cnt);
+        cnt = popcount(sib & (kKingRings.le5[wk] | kKingRings.le5[bk]) &
+                       ~(kKingRings.le3[wk] | kKingRings.le3[bk]));
+        if (cnt) TADD(F_KNIGHT_SIBERIA, cnt);
+    }
+    {
+        Bitboard sib = b.pieceBb[KNIGHT] & black;
+        int cnt = popcount(sib & ~(kKingRings.le5[wk] | kKingRings.le5[bk]));
+        if (cnt) TADD(F_KNIGHT_SIBERIA2, -cnt);
+        cnt = popcount(sib & (kKingRings.le5[wk] | kKingRings.le5[bk]) &
+                       ~(kKingRings.le3[wk] | kKingRings.le3[bk]));
+        if (cnt) TADD(F_KNIGHT_SIBERIA, -cnt);
     }
 
     Bitboard bi = b.pieceBb[BISHOP] & white;
@@ -796,21 +930,28 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         wBishopAtt |= att;
         int safe = popcount(att & wMobArea);
         TADD(F_MOB_B0 + safe, 1);
-        int zoneHits = popcount(att & bkZone & ~bPawnAtt2);
-        if (zoneHits > 0) {
+        if (Bitboard zh = att & bkTargetZone) {
             wAttackers++;
-            wDanger += KING_ATTACK_WEIGHT[BISHOP] + zoneHits / 2;
+            wDanger += KING_ATTACK_WEIGHT[BISHOP] + popcount(zh) / 2;
         }
-        if ((sq >> 3) >= 3 && (sq >> 3) <= 5 && (wp & PAWN_ATT[BLACK][sq]) != 0 &&
-            (bp & PAWN_ATT[WHITE][sq]) == 0) {
-            TADD(F_OUTPOST_BISHOP, 1);
-        }
+        // v1.4.27 (Prev-B1): the outpost test moved to the whole-bitboard
+        // terms above the mobility loops.
+        // v1.4.25 (B4): structural terms fused from the old standalone
+        // bishop loop (same iteration set — additive, order-independent).
+        // v1.4.28 (B2): F_BAD_BISHOP / F_BISHOP_RAMMED hoisted below the
+        // loops (factored per color complex — see the hoisted block); the
+        // behind-pawn term was already whole-bitboard above.
         // Bishop on a long diagonal (rim squares) hitting both centres
         // through the pawn wall.
+        // v1.4.27 (B3): the coordinate arithmetic collapses into one
+        // constant bitboard test — LONG_DIAG_NONCENTER holds exactly the
+        // 12 squares with f == r or f + r == 7 minus the four centre
+        // squares (bits 0,7,9,14,18,21,42,45,49,54,56,63 = 0x8142240000244281),
+        // and popcount(...) >= 2 becomes moreThanOne (b & (b-1) != 0 —
+        // one AND instead of a popcount). Same predicate, 2 tests.
         {
-            int f = sq & 7, r = sq >> 3;
-            bool onLong = (f == r || f + r == 7) && !(f >= 3 && f <= 4 && r >= 3 && r <= 4);
-            if (onLong && popcount(bishopAttacks(sq, allPawns) & CENTER_SQ) >= 2)
+            if ((bitOf(sq) & LONG_DIAG_NONCENTER) &&
+                moreThanOne(bishopAttacks(sq, allPawns) & CENTER_SQ))
                 TADD(F_BISHOP_LONG_DIAG, 1);
         }
     }
@@ -822,20 +963,53 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         bBishopAtt |= att;
         int safe = popcount(att & bMobArea);
         TADD(F_MOB_B0 + safe, -1);
-        int zoneHits = popcount(att & wkZone & ~wPawnAtt2);
-        if (zoneHits > 0) {
+        if (Bitboard zh = att & wkTargetZone) {
             bAttackers++;
-            bDanger += KING_ATTACK_WEIGHT[BISHOP] + zoneHits / 2;
+            bDanger += KING_ATTACK_WEIGHT[BISHOP] + popcount(zh) / 2;
         }
-        if ((7 - (sq >> 3)) >= 3 && (7 - (sq >> 3)) <= 5 &&
-            (bp & PAWN_ATT[WHITE][sq]) != 0 && (wp & PAWN_ATT[BLACK][sq]) == 0) {
-            TADD(F_OUTPOST_BISHOP, -1);
-        }
+        // v1.4.27 (Prev-B1): outpost — whole-bitboard above.
+        // v1.4.25 (B4): structural terms fused from the old standalone
+        // bishop loop (see the white loop). v1.4.28 (B2): F_BAD_BISHOP /
+        // F_BISHOP_RAMMED hoisted below the loops.
         {
-            int f = sq & 7, r = sq >> 3;
-            bool onLong = (f == r || f + r == 7) && !(f >= 3 && f <= 4 && r >= 3 && r <= 4);
-            if (onLong && popcount(bishopAttacks(sq, allPawns) & CENTER_SQ) >= 2)
+            if ((bitOf(sq) & LONG_DIAG_NONCENTER) &&
+                moreThanOne(bishopAttacks(sq, allPawns) & CENTER_SQ))
                 TADD(F_BISHOP_LONG_DIAG, -1);
+        }
+    }
+    // v1.4.28 (B2): hoisted bad-bishop / rammed-bishop terms. Bishops on
+    // one color complex all see the SAME pawn counts, so the per-bishop
+    // sum factors into (bishops on complex) x (complex pawn count). 6
+    // popcounts per side replace 2 per bishop; the multiplication is
+    // exact (integer).
+    {
+        Bitboard wBb = b.pieceBb[BISHOP] & white;
+        int wBL = popcount(wBb & LIGHT_SQUARES), wBD = popcount(wBb & DARK_SQUARES);
+        if (wBL) {
+            int cnt = wBL * popcount(wp & LIGHT_SQUARES);
+            if (cnt) TADD(F_BAD_BISHOP, cnt);
+            cnt = wBL * popcount(wRammed & LIGHT_SQUARES);
+            if (cnt) TADD(F_BISHOP_RAMMED, cnt);
+        }
+        if (wBD) {
+            int cnt = wBD * popcount(wp & DARK_SQUARES);
+            if (cnt) TADD(F_BAD_BISHOP, cnt);
+            cnt = wBD * popcount(wRammed & DARK_SQUARES);
+            if (cnt) TADD(F_BISHOP_RAMMED, cnt);
+        }
+        Bitboard bBb = b.pieceBb[BISHOP] & black;
+        int bBL = popcount(bBb & LIGHT_SQUARES), bBD = popcount(bBb & DARK_SQUARES);
+        if (bBL) {
+            int cnt = bBL * popcount(bp & LIGHT_SQUARES);
+            if (cnt) TADD(F_BAD_BISHOP, -cnt);
+            cnt = bBL * popcount(bRammed & LIGHT_SQUARES);
+            if (cnt) TADD(F_BISHOP_RAMMED, -cnt);
+        }
+        if (bBD) {
+            int cnt = bBD * popcount(bp & DARK_SQUARES);
+            if (cnt) TADD(F_BAD_BISHOP, -cnt);
+            cnt = bBD * popcount(bRammed & DARK_SQUARES);
+            if (cnt) TADD(F_BISHOP_RAMMED, -cnt);
         }
     }
 
@@ -847,11 +1021,30 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         wRookAtt |= att;
         int safe = popcount(att & wMobArea);
         TADD(F_MOB_R0 + safe, 1);
-        int zoneHits = popcount(att & bkZone & ~bPawnAtt2);
-        if (zoneHits > 0) {
+        if (Bitboard zh = att & bkTargetZone) {
             wAttackers++;
-            wDanger += KING_ATTACK_WEIGHT[ROOK] + zoneHits / 2;
+            wDanger += KING_ATTACK_WEIGHT[ROOK] + popcount(zh) / 2;
         }
+        // v1.4.25 (B4): structural terms fused from the old standalone rook
+        // loop. F_ROOK_BEHIND_PASSER's inner while scan is now the O(1)
+        // "any passer strictly above/below on this file" mask test —
+        // identical single TADD when any such passer exists.
+        {
+            Bitboard fileBb = FILES_BB[sq & 7];
+            if ((wp & fileBb) == 0) {
+                if ((bp & fileBb) == 0) TADD(F_ROOK_OPEN, 1);
+                else TADD(F_ROOK_SEMI, 1);
+            }
+            // v1.4.28 (B2): F_ROOK_7TH hoisted below the loop.
+            if (wPassers & fileBb & ~RANKS_LE[sq >> 3]) TADD(F_ROOK_BEHIND_PASSER, 1);
+        }
+    }
+    // v1.4.28 (B2): hoisted rook-on-7th (white) — every white rook on rank
+    // 6 with any enemy pawn on rank 6 counted +1, exactly the per-rook
+    // predicate (the enemy-pawn gate is loop-invariant).
+    if ((b.pieceBb[ROOK] & white & RANKS_BB[6]) && (bp & RANKS_BB[6])) {
+        int cnt = popcount(b.pieceBb[ROOK] & white & RANKS_BB[6]);
+        TADD(F_ROOK_7TH, cnt);
     }
     ro = b.pieceBb[ROOK] & black;
     while (ro) {
@@ -861,11 +1054,25 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         bRookAtt |= att;
         int safe = popcount(att & bMobArea);
         TADD(F_MOB_R0 + safe, -1);
-        int zoneHits = popcount(att & wkZone & ~wPawnAtt2);
-        if (zoneHits > 0) {
+        if (Bitboard zh = att & wkTargetZone) {
             bAttackers++;
-            bDanger += KING_ATTACK_WEIGHT[ROOK] + zoneHits / 2;
+            bDanger += KING_ATTACK_WEIGHT[ROOK] + popcount(zh) / 2;
         }
+        // v1.4.25 (B4): structural terms fused from the old standalone rook
+        // loop (see the white loop). v1.4.28 (B2): F_ROOK_7TH hoisted below.
+        {
+            Bitboard fileBb = FILES_BB[sq & 7];
+            if ((bp & fileBb) == 0) {
+                if ((wp & fileBb) == 0) TADD(F_ROOK_OPEN, -1);
+                else TADD(F_ROOK_SEMI, -1);
+            }
+            if (bPassers & fileBb & ~RANKS_GE[sq >> 3]) TADD(F_ROOK_BEHIND_PASSER, -1);
+        }
+    }
+    // v1.4.28 (B2): hoisted rook-on-7th (black, rank 1, white pawns).
+    if ((b.pieceBb[ROOK] & black & RANKS_BB[1]) && (wp & RANKS_BB[1])) {
+        int cnt = popcount(b.pieceBb[ROOK] & black & RANKS_BB[1]);
+        TADD(F_ROOK_7TH, -cnt);
     }
 
     Bitboard qu = b.pieceBb[QUEEN] & white;
@@ -876,10 +1083,9 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         wQueenAtt |= att;
         int safe = popcount(att & wMobArea);
         TADD(F_MOB_Q0 + safe, 1);
-        int zoneHits = popcount(att & bkZone & ~bPawnAtt2);
-        if (zoneHits > 0) {
+        if (Bitboard zh = att & bkTargetZone) {
             wAttackers++;
-            wDanger += KING_ATTACK_WEIGHT[QUEEN] + zoneHits / 2;
+            wDanger += KING_ATTACK_WEIGHT[QUEEN] + popcount(zh) / 2;
         }
     }
     qu = b.pieceBb[QUEEN] & black;
@@ -890,10 +1096,9 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         bQueenAtt |= att;
         int safe = popcount(att & bMobArea);
         TADD(F_MOB_Q0 + safe, -1);
-        int zoneHits = popcount(att & wkZone & ~wPawnAtt2);
-        if (zoneHits > 0) {
+        if (Bitboard zh = att & wkTargetZone) {
             bAttackers++;
-            bDanger += KING_ATTACK_WEIGHT[QUEEN] + zoneHits / 2;
+            bDanger += KING_ATTACK_WEIGHT[QUEEN] + popcount(zh) / 2;
         }
     }
 
@@ -952,32 +1157,30 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
             if (cnt) TADD(F_THREAT_BY_PUSH, -cnt);
         }
 
-        // Weak pawns: attacked by an enemy pawn, not defended by own pawns.
-        cnt = popcount(wp & bPawnAtt & ~wPawnAtt);
-        if (cnt) TADD(F_WEAK_PAWN, cnt);
-        cnt = popcount(bp & wPawnAtt & ~bPawnAtt);
-        if (cnt) TADD(F_WEAK_PAWN, -cnt);
+        // v1.4.27 (Prev-B1): weak pawns — pure (wp, bp), moved into
+        // pawnStructure (pawn-hash cached).
 
         // Clean promotion paths: rank>=5 passers with empty, unattacked
         // squares all the way to promotion.
+        // v1.4.25 (B4): the passer sets are pre-masked to the promotion
+        // ranks (~RANKS_LE[4] / ~RANKS_GE[3] — INCLUDING the vacuous
+        // promotion-rank passers, whose empty path fires the term exactly
+        // as the old inner rank check did), so the loop bodies run only
+        // for candidates that can pass the rank gate.
         {
-            Bitboard bb2 = wPassers;
+            Bitboard bb2 = wPassers & ~RANKS_LE[4];
             while (bb2) {
                 int sq = lsb(bb2);
                 bb2 &= bb2 - 1;
-                if ((sq >> 3) >= 5) {
-                    Bitboard path = FILES_BB[sq & 7] & ~RANKS_LE[sq >> 3];
-                    if ((path & (occ | bAllAtt)) == 0) TADD(F_PASSED_PATH, 1);
-                }
+                Bitboard path = FILES_BB[sq & 7] & ~RANKS_LE[sq >> 3];
+                if ((path & (occ | bAllAtt)) == 0) TADD(F_PASSED_PATH, 1);
             }
-            bb2 = bPassers;
+            bb2 = bPassers & ~RANKS_GE[3];
             while (bb2) {
                 int sq = lsb(bb2);
                 bb2 &= bb2 - 1;
-                if ((sq >> 3) <= 2) {
-                    Bitboard path = FILES_BB[sq & 7] & ~RANKS_GE[sq >> 3];
-                    if ((path & (occ | wAllAtt)) == 0) TADD(F_PASSED_PATH, -1);
-                }
+                Bitboard path = FILES_BB[sq & 7] & ~RANKS_GE[sq >> 3];
+                if ((path & (occ | wAllAtt)) == 0) TADD(F_PASSED_PATH, -1);
             }
         }
 
@@ -1003,45 +1206,54 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         // provably-defended -> O(1), only the residual pays attackersTo.
         Bitboard blackStrictDef = bPawnAtt | bKnightAtt | bQueenAtt | bKingAttGate;
         Bitboard whiteStrictDef = wPawnAtt | wKnightAtt | wQueenAtt | wKingAttGate;
-        Bitboard victims = bMinors & wAllAtt;
-        while (victims) {
-            int sq = lsb(victims);
-            victims &= victims - 1;
-            Bitboard sqBb = bitOf(sq);
-            if ((sqBb & blackDefGate) == 0 ||
-                ((sqBb & blackStrictDef) == 0 &&
-                 (b.attackersTo(sq, occ) & black & ~sqBb) == 0))
-                TADD(F_HANGING_MINOR, 1);
+        // v1.4.26 (B4): O(1) partition of the victim set. The per-square
+        // predicate above has exactly three outcomes over the victim set:
+        //   victims & ~defGate            -> hanging  (first || arm true)
+        //   victims & defGate & strictDef -> defended (second arm's guard
+        //                                        (sqBb & strictDef) == 0 false)
+        //   victims & defGate & ~strictDef-> the exact attackersTo test
+        // The first two classes resolve by popcount alone — the while loop
+        // (and its per-square bit extraction) now walks ONLY the residual
+        // x-ray-defended squares, so the loop body is skipped entirely on
+        // the >90% of evaluate() calls whose victims land wholly in the
+        // first two classes. TADD is linear (mgScore/egScore += w*amt), so
+        // batching the counts into one add is bit-identical.
+        {
+            int hangMin = popcount(bMinors & wAllAtt & ~blackDefGate);
+            int hangMaj = popcount(bMajors & wAllAtt & ~blackDefGate);
+            Bitboard resid = (bMinors | bMajors) & wAllAtt & blackDefGate &
+                             ~blackStrictDef;
+            while (resid) {
+                int sq = lsb(resid);
+                resid &= resid - 1;
+                if ((b.attackersTo(sq, occ) & black & ~bitOf(sq)) == 0) {
+                    // classify the residual victim by type
+                    if (bitOf(sq) & bMinors)
+                        hangMin++;
+                    else
+                        hangMaj++;
+                }
+            }
+            if (hangMin) TADD(F_HANGING_MINOR, hangMin);
+            if (hangMaj) TADD(F_HANGING_MAJOR, hangMaj);
         }
-        victims = bMajors & wAllAtt;
-        while (victims) {
-            int sq = lsb(victims);
-            victims &= victims - 1;
-            Bitboard sqBb = bitOf(sq);
-            if ((sqBb & blackDefGate) == 0 ||
-                ((sqBb & blackStrictDef) == 0 &&
-                 (b.attackersTo(sq, occ) & black & ~sqBb) == 0))
-                TADD(F_HANGING_MAJOR, 1);
-        }
-        victims = wMinors & bAllAtt;
-        while (victims) {
-            int sq = lsb(victims);
-            victims &= victims - 1;
-            Bitboard sqBb = bitOf(sq);
-            if ((sqBb & whiteDefGate) == 0 ||
-                ((sqBb & whiteStrictDef) == 0 &&
-                 (b.attackersTo(sq, occ) & white & ~sqBb) == 0))
-                TADD(F_HANGING_MINOR, -1);
-        }
-        victims = wMajors & bAllAtt;
-        while (victims) {
-            int sq = lsb(victims);
-            victims &= victims - 1;
-            Bitboard sqBb = bitOf(sq);
-            if ((sqBb & whiteDefGate) == 0 ||
-                ((sqBb & whiteStrictDef) == 0 &&
-                 (b.attackersTo(sq, occ) & white & ~sqBb) == 0))
-                TADD(F_HANGING_MAJOR, -1);
+        {
+            int hangMin = popcount(wMinors & bAllAtt & ~whiteDefGate);
+            int hangMaj = popcount(wMajors & bAllAtt & ~whiteDefGate);
+            Bitboard resid = (wMinors | wMajors) & bAllAtt & whiteDefGate &
+                             ~whiteStrictDef;
+            while (resid) {
+                int sq = lsb(resid);
+                resid &= resid - 1;
+                if ((b.attackersTo(sq, occ) & white & ~bitOf(sq)) == 0) {
+                    if (bitOf(sq) & wMinors)
+                        hangMin++;
+                    else
+                        hangMaj++;
+                }
+            }
+            if (hangMin) TADD(F_HANGING_MINOR, -hangMin);
+            if (hangMaj) TADD(F_HANGING_MAJOR, -hangMaj);
         }
     }
 
@@ -1063,8 +1275,9 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         if (cnt) TADD(F_SPACE_RESTRICT, -cnt);
 
         // Uncontested central squares matter while much material remains.
-        int bigMaterial = popcount(b.pieceBb[KNIGHT] | b.pieceBb[BISHOP]) +
-                          2 * popcount(b.pieceBb[ROOK] | b.pieceBb[QUEEN]);
+        // (v1.4.24 L6: reads the hoisted counts — KNIGHT and BISHOP are
+        // disjoint bitboards, so the sums are the same popcounts.)
+        int bigMaterial = (wNc + bNc + wBc + bBc) + 2 * (wRc + bRc + wQc + bQc);
         if (bigMaterial > 12) {
             Bitboard centerBig = (FILES_BB[2] | FILES_BB[3] | FILES_BB[4] | FILES_BB[5]) &
                                  (RANKS_BB[2] | RANKS_BB[3] | RANKS_BB[4] | RANKS_BB[5]);
@@ -1079,19 +1292,14 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
 
     // ---- Closedness: knights like closed, rooks like open positions ----
     {
-        int pawnCount = popcount(allPawns);
-        int rammedCount = popcount(wRammed);
-        // v1.4.1 bit-exact speedup: south-fill file occupancy replaces the
-        // 8-iteration loop — bit f set iff file f has any pawn.
-        Bitboard openFilesBb = allPawns;
-        openFilesBb |= openFilesBb >> 8;
-        openFilesBb |= openFilesBb >> 16;
-        openFilesBb |= openFilesBb >> 32;
-        int openFiles = 8 - popcount(openFilesBb & 0xFF);
-        int closedness = (pawnCount + 3 * rammedCount - 4 * openFiles) / 3;
-        closedness = clampI2(closedness, 0, 8);
-        int knDiff = popcount(b.pieceBb[KNIGHT] & white) - popcount(b.pieceBb[KNIGHT] & black);
-        int roDiff = popcount(b.pieceBb[ROOK] & white) - popcount(b.pieceBb[ROOK] & black);
+        // v1.4.27 (Prev-B1): the index computation (south-fill open files
+        // + rammed count + pawn count) is pure (wp, bp) and now rides the
+        // pawn hash entry (computed in pawnStructure); only the piece-count
+        // multipliers stay live.
+        int closedness = pe->closedIdx;
+        // (v1.4.24 L6: reads the hoisted counts.)
+        int knDiff = wNc - bNc;
+        int roDiff = wRc - bRc;
         if (closedness <= 2) {
             TADD(F_CLOSED_KNIGHT_OPEN, knDiff);
             TADD(F_CLOSED_ROOK_OPEN, roDiff);
@@ -1113,8 +1321,18 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         // (wAtt2/bAtt2/wKingAtt/bKingAtt hoisted above the space block.)
         Bitboard bAllDef = bAllAtt | bKingAtt;
         Bitboard wAllDef = wAllAtt | wKingAtt;
+        // v1.4.24 (L6): each side's safe-check scan is gated on the SAME
+        // condition that consumes its result below. When the attacker gate
+        // fails, wAmount/bAmount stay 0 and wBk/bBk stay -1 — the old code
+        // still ran bishopAttacks/rookAttacks on the defender king square
+        // and 10 popcounts per side only to discard the danger units.
+        // Bit-exact skip: identical outputs on every input.
+        bool wQ = wQc > 0;
+        bool bQ = bQc > 0;
+        int wAmount = 0, bAmount = 0;
+        int wBk = -1, bBk = -1;   // danger-bucket for the SAFETY-curve correction
         // White attacking the black king.
-        {
+        if (wAttackers >= 2 || (wAttackers >= 1 && wQ)) {
             Bitboard weak = wAllAtt & ~bAtt2 & (~bAllDef | bQueenAtt | bKingAtt);
             Bitboard safe = ~white & (~bAllDef | (weak & wAtt2));
             Bitboard bishChk = bishopAttacks(bk, occ);
@@ -1128,9 +1346,13 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
             int weakSq = popcount(weak & bkZone);
             if (weakSq > 4) weakSq = 4;
             wDanger += 2 * weakSq;
+            // Queenless attacks rarely mate: cap the danger units.
+            if (!wQ) wDanger = wDanger < 12 ? wDanger : 12;
+            wAmount = SAFETY[wDanger > 63 ? 63 : wDanger];
+            wBk = (wDanger > 63 ? 63 : wDanger) >> 3;
         }
         // Black attacking the white king.
-        {
+        if (bAttackers >= 2 || (bAttackers >= 1 && bQ)) {
             Bitboard weak = bAllAtt & ~wAtt2 & (~wAllDef | wQueenAtt | wKingAtt);
             Bitboard safe = ~black & (~wAllDef | (weak & bAtt2));
             Bitboard bishChk = bishopAttacks(wk, occ);
@@ -1144,31 +1366,26 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
             int weakSq = popcount(weak & wkZone);
             if (weakSq > 4) weakSq = 4;
             bDanger += 2 * weakSq;
-        }
-
-        // Queenless attacks rarely mate: cap the danger units.
-        bool wQ = (b.pieceBb[QUEEN] & white) != 0;
-        bool bQ = (b.pieceBb[QUEEN] & black) != 0;
-        if (!wQ) wDanger = wDanger < 12 ? wDanger : 12;
-        if (!bQ) bDanger = bDanger < 12 ? bDanger : 12;
-
-        int wAmount = 0, bAmount = 0;
-        int wBk = -1, bBk = -1;   // danger-bucket for the SAFETY-curve correction
-        if (wAttackers >= 2 || (wAttackers >= 1 && wQ)) {
-            wAmount = SAFETY[wDanger > 63 ? 63 : wDanger];
-            wBk = (wDanger > 63 ? 63 : wDanger) >> 3;
-        }
-        if (bAttackers >= 2 || (bAttackers >= 1 && bQ)) {
+            // Queenless attacks rarely mate: cap the danger units.
+            if (!bQ) bDanger = bDanger < 12 ? bDanger : 12;
             bAmount = SAFETY[bDanger > 63 ? 63 : bDanger];
             bBk = (bDanger > 63 ? 63 : bDanger) >> 3;
         }
         int d = wAmount - bAmount;
         if (d != 0) {
-            mgScore += EV_MG[F_DANGER] * d;
-            egScore += EV_EG[F_DANGER] * (d / 2);
-            if (tr) {
-                tr->mgAmt[F_DANGER] += d;
-                tr->egAmt[F_DANGER] += d / 2;
+            // v1.4.28 (B2): TUNED_EV_* on the non-trace path — the mutable
+            // EV_* globals forced a reload per evaluation; the internal-
+            // linkage constant tables fold to immediates.
+            if constexpr (Trace) {
+                mgScore += EV_MG[F_DANGER] * d;
+                egScore += EV_EG[F_DANGER] * (d / 2);
+                if (tr) {
+                    tr->mgAmt[F_DANGER] += d;
+                    tr->egAmt[F_DANGER] += d / 2;
+                }
+            } else {
+                mgScore += TUNED_EV_MG[F_DANGER] * d;
+                egScore += TUNED_EV_EG[F_DANGER] * (d / 2);
             }
         }
         // v2.6: tunable per-bucket correction on top of the fixed SAFETY
@@ -1176,22 +1393,33 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
         // (defaults 0 == bit-exact v2.6.0 eval). Bucket k covers danger
         // 8k..8k+7, gated exactly like the wAmount/bAmount above.
         if (wBk >= 0 || bBk >= 0) {
-            if (wBk >= 0) {
-                mgScore += EV_MG[F_DCOR_B0 + wBk];
-                egScore += EV_EG[F_DCOR_B0 + wBk];
-            }
-            if (bBk >= 0) {
-                mgScore -= EV_MG[F_DCOR_B0 + bBk];
-                egScore -= EV_EG[F_DCOR_B0 + bBk];
-            }
-            if (tr) {
+            if constexpr (Trace) {
                 if (wBk >= 0) {
-                    tr->mgAmt[F_DCOR_B0 + wBk] += 1;
-                    tr->egAmt[F_DCOR_B0 + wBk] += 1;
+                    mgScore += EV_MG[F_DCOR_B0 + wBk];
+                    egScore += EV_EG[F_DCOR_B0 + wBk];
                 }
                 if (bBk >= 0) {
-                    tr->mgAmt[F_DCOR_B0 + bBk] -= 1;
-                    tr->egAmt[F_DCOR_B0 + bBk] -= 1;
+                    mgScore -= EV_MG[F_DCOR_B0 + bBk];
+                    egScore -= EV_EG[F_DCOR_B0 + bBk];
+                }
+                if (tr) {
+                    if (wBk >= 0) {
+                        tr->mgAmt[F_DCOR_B0 + wBk] += 1;
+                        tr->egAmt[F_DCOR_B0 + wBk] += 1;
+                    }
+                    if (bBk >= 0) {
+                        tr->mgAmt[F_DCOR_B0 + bBk] -= 1;
+                        tr->egAmt[F_DCOR_B0 + bBk] -= 1;
+                    }
+                }
+            } else {
+                if (wBk >= 0) {
+                    mgScore += TUNED_EV_MG[F_DCOR_B0 + wBk];
+                    egScore += TUNED_EV_EG[F_DCOR_B0 + wBk];
+                }
+                if (bBk >= 0) {
+                    mgScore -= TUNED_EV_MG[F_DCOR_B0 + bBk];
+                    egScore -= TUNED_EV_EG[F_DCOR_B0 + bBk];
                 }
             }
         }
@@ -1200,30 +1428,45 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
     // ---- v2.5: simplification — the side ahead in material prefers
     // piece trades (fewer non-pawn pieces left) in the endgame ----
     {
-        int nonPawnTotal = popcount((b.pieceBb[KNIGHT] | b.pieceBb[BISHOP] |
-                                     b.pieceBb[ROOK] | b.pieceBb[QUEEN]) &
-                                    (white | black));
+        int nonPawnTotal = wNc + bNc + wBc + bBc + wRc + bRc + wQc + bQc;
         if (egScore > 25) TADD(F_SIMPLIFY, -nonPawnTotal);
         else if (egScore < -25) TADD(F_SIMPLIFY, nonPawnTotal);
     }
 
     // ---- Tempo (linear, traced; moved around the scaling below) ----
     int tempoSgn = b.sideToMove == WHITE ? 1 : -1;
-    mgScore += EV_MG[F_TEMPO] * tempoSgn;
-    egScore += EV_EG[F_TEMPO] * tempoSgn;
-    if (tr) {
-        tr->mgAmt[F_TEMPO] += tempoSgn;
-        tr->egAmt[F_TEMPO] += tempoSgn;
+    // v1.4.28 (B2): TUNED_EV_* on the non-trace path (compile-time-folded
+    // loads). The add/subtract-around-scaling pair is NOT redundant: the
+    // endgame scaling divides egScore, so tempo-in vs tempo-out rounds
+    // differently — the Ethereal ordering stays intact.
+    if constexpr (Trace) {
+        mgScore += EV_MG[F_TEMPO] * tempoSgn;
+        egScore += EV_EG[F_TEMPO] * tempoSgn;
+        if (tr) {
+            tr->mgAmt[F_TEMPO] += tempoSgn;
+            tr->egAmt[F_TEMPO] += tempoSgn;
+        }
+    } else {
+        mgScore += TUNED_EV_MG[F_TEMPO] * tempoSgn;
+        egScore += TUNED_EV_EG[F_TEMPO] * tempoSgn;
     }
 
     // Tuner reference: the fully linear score (pre-scaling), white POV.
     int linMg = mgScore, linEg = egScore;
-    if (tr) tr->preScaleScore = (linMg * phase + linEg * (24 - phase)) / 24;
+    if constexpr (Trace) {
+        if (tr) tr->preScaleScore = (linMg * phase + linEg * (24 - phase)) / 24;
+    }
+    (void)linMg; (void)linEg;
 
     // Remove the tempo for the scalings (Ethereal ordering: conversion
     // scaling must neither damp nor amplify the tempo), re-added below.
-    mgScore -= EV_MG[F_TEMPO] * tempoSgn;
-    egScore -= EV_EG[F_TEMPO] * tempoSgn;
+    if constexpr (Trace) {
+        mgScore -= EV_MG[F_TEMPO] * tempoSgn;
+        egScore -= EV_EG[F_TEMPO] * tempoSgn;
+    } else {
+        mgScore -= TUNED_EV_MG[F_TEMPO] * tempoSgn;
+        egScore -= TUNED_EV_EG[F_TEMPO] * tempoSgn;
+    }
 
     // ---- endgame material scaling (drawish structures) ----
     {
@@ -1310,7 +1553,9 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
             egScore += (egScore > 0 ? v : -v);
             scaled = true;
         }
-        if (tr) tr->scaled = tr->scaled || scaled;
+        if constexpr (Trace) {
+            if (tr) tr->scaled = tr->scaled || scaled;
+        }
     }
 
     // ---- v9.2 mop-up: convert KX vs K instead of shuffling into the 50-move rule ----
@@ -1410,14 +1655,22 @@ int evaluate(const Position &b, PawnHashTable &pawnHash, EvalTrace *trace) {
     }
 
     // Re-add the tempo after scaling.
-    mgScore += EV_MG[F_TEMPO] * tempoSgn;
-    egScore += EV_EG[F_TEMPO] * tempoSgn;
+    // v1.4.28 (B2): TUNED_EV_* on the non-trace path.
+    if constexpr (Trace) {
+        mgScore += EV_MG[F_TEMPO] * tempoSgn;
+        egScore += EV_EG[F_TEMPO] * tempoSgn;
+    } else {
+        mgScore += TUNED_EV_MG[F_TEMPO] * tempoSgn;
+        egScore += TUNED_EV_EG[F_TEMPO] * tempoSgn;
+    }
 
     int score = (mgScore * phase + egScore * (24 - phase)) / 24;
     if (score > 29000) score = 29000;
     if (score < -29000) score = -29000;
     return (b.sideToMove == WHITE) ? score : -score;
 }
+
+}  // namespace
 
 std::string mirrorFen(const std::string &fen) {
     // Split into fields.

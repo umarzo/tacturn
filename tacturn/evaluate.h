@@ -47,13 +47,17 @@ namespace tacturn {
  *  F_PAWN_BLOCKED (full occupancy) are NOT king-position terms and stay
  *  live in evaluate(). */
 struct PawnEntry {
+    // v1.4.25 (B4): field order packed so the struct is exactly 40 bytes
+    // (was 48: the trailing bool forced 8 bytes of tail padding). Pure
+    // reordering — every field keeps its type and value, so the cached
+    // terms are bit-identical; the pawn table drops 768 KB -> 640 KB.
     Bitboard key = 0;
     int mg = 0, eg = 0;
     Bitboard wPass = 0, bPass = 0;
     uint8_t wkSq = 0, bkSq = 0;   // king squares the cached terms used
-    uint8_t kingGate = 0;         // 1 = the phase > 6 shelter gate was ON
+    uint8_t kingFlags = 0;        // bit0 valid, bit1 shelter gate (Prev-B1)
+    uint8_t closedIdx = 0;        // closedness index 0..8 (Prev-B1)
     int16_t kpMg = 0, kpEg = 0;   // king-position tapered term sum
-    bool kingValid = false;
 };
 
 class PawnHashTable {

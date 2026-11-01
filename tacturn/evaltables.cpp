@@ -16,19 +16,10 @@ int PST_MG[6][64];
 int PST_EG[6][64];
 int PST_MG_BLACK[6][64];
 int PST_EG_BLACK[6][64];
-int PHASE_WEIGHT[6] = {0, 1, 1, 2, 4, 0};
 int PASSED_MG[8];  // kept in sync with EV_[MG|EG][F_PASSED_R*] at init
 int PASSED_EG[8];
-int KING_ATTACK_WEIGHT[6] = {0, 2, 2, 3, 5, 0};
-
-int SAFETY[64] = {
-    0, 0, 1, 2, 3, 5, 7, 9, 12, 15, 18, 22, 26, 30, 35, 39,
-    44, 50, 56, 61, 68, 75, 83, 91, 100, 110, 120, 131, 142, 154, 167, 180,
-    195, 211, 227, 244, 263, 282, 302, 324, 346, 370, 395, 421, 448, 476, 506, 537,
-    569, 603, 639, 676, 715, 755, 797, 841, 887, 935, 985, 1037, 1091, 1147, 1205, 1265
-};
-
-int MOBILITY_BASE[6] = {0, 4, 6, 7, 13, 0};
+// (v1.4.28 B2: PHASE_WEIGHT / KING_ATTACK_WEIGHT / SAFETY / MOBILITY_BASE
+//  are inline constexpr in evaltables.h now.)
 
 // ---- Tunable evaluation-term parameters (midgame / endgame) ----
 // Starting values: the hand-tuned v2.1 set where the term existed; new

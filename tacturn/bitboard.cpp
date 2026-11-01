@@ -1,4 +1,34 @@
 // TacTurn Chess Engine v1 — bitboard table generation (magic bitboards).
+//
+// v1.4.25 (B1): magicMask edge-stripping fixed. The old formula
+//     edges = (R1|R8|FA|FH) & ~(R[own] | F[own])
+// intersected the edge set with the complement of the rook's own rank ∪
+// own file. Every square of a ROOK ray lies on the rook's rank or file,
+// so `ray & ~edges == ray` for every rook square: no edge was ever
+// stripped and ROOK_MASK kept all 14 bits — 64 × 2^14 = 1,048,576 table
+// entries (8.39 MB) per table instead of 102,400 (800 KB), blowing out
+// L2/L3 on every slider lookup. The Stockfish form,
+//     edges = ((R1|R8) & ~R[own]) | ((FA|FH) & ~F[own]),
+// strips exactly the ray endpoints a blocker can never hide behind.
+// Both ROOK_ATT and PEXT_ROOK shrink 10.24x (16.78 MB -> 1.64 MB total).
+// Bishop masks were already correct under the old formula (a bishop ray
+// never touches its own rank/file), so bishop tables are unchanged in
+// size; the magic search consumes a different number of PRNG draws after
+// the rook fix, so the found bishop magics differ — the ATTACK SETS every
+// lookup returns are bit-identical for every (sq, occ), which is the
+// contract the rest of the engine relies on (bench-verified bit-exact:
+// 196,608 / 1,881,088 nodes on benches 9 / 14).
+//
+// v1.4.25 (B1): all four slider tables are backed by contiguous
+// alignas(64) static pools (no 256 fragmented new[] allocations, no
+// allocator round-trip at startup) and indexed through MagicSlot /
+// PextSlot descriptors.
+//
+// v1.4.25 (B2): ROOK_PSEUDO / BISHOP_PSEUDO (empty-board rays) are built
+// here and exported for the pseudo-ray gating at the engine's hottest
+// slider call sites.
+//
+// All original code — MIT licensed, TacTurn contributors.
 
 #include "bitboard.h"
 
@@ -30,14 +60,13 @@ Bitboard Z_CASTLE[16];
 Bitboard Z_EP_FILE[8];
 Bitboard Z_SIDE;
 
-Bitboard ROOK_MASK[64];
-Bitboard BISHOP_MASK[64];
-Bitboard ROOK_MAGIC_N[64];
-Bitboard BISHOP_MAGIC_N[64];
-int ROOK_SHIFT[64];
-int BISHOP_SHIFT[64];
-Bitboard *ROOK_ATT[64];
-Bitboard *BISHOP_ATT[64];
+// v1.4.25 (B2): empty-board pseudo rays (occupancy-independent).
+Bitboard ROOK_PSEUDO[64];
+Bitboard BISHOP_PSEUDO[64];
+
+// v1.4.25 (B1): packed per-square magic descriptors over static pools.
+MagicSlot ROOK_MAGICS[64];
+MagicSlot BISHOP_MAGICS[64];
 
 namespace {
 
@@ -45,6 +74,15 @@ constexpr int DIR_DR[8] = {1, -1, 0, 0, 1, 1, -1, -1};
 constexpr int DIR_DF[8] = {0, 0, 1, -1, 1, -1, 1, -1};
 constexpr int DIRS_R[4] = {0, 1, 2, 3};   // N, S, E, W
 constexpr int DIRS_B[4] = {4, 5, 6, 7};   // NE, NW, SE, SW
+
+// Pool totals with the FIXED relevant-occupancy masks:
+//   rook   = 36*2^10 + 24*2^11 + 4*2^12 = 102,400 entries (800 KB)
+//   bishop = sum of 2^bits                          =  5,248 entries (41 KB)
+constexpr size_t ROOK_POOL_SIZE = 102400;
+constexpr size_t BISHOP_POOL_SIZE = 5248;
+
+alignas(64) Bitboard ROOK_ATT_POOL[ROOK_POOL_SIZE];
+alignas(64) Bitboard BISHOP_ATT_POOL[BISHOP_POOL_SIZE];
 
 inline bool onBoard(int r, int f) { return r >= 0 && r < 8 && f >= 0 && f < 8; }
 
@@ -66,11 +104,15 @@ Bitboard slidingAttacks(int sq, Bitboard occ, const int *dirs) {
     return att;
 }
 
-/** Relevant-occupancy mask: ray squares excluding edges not on the rays' lines. */
+/** Relevant-occupancy mask: ray squares excluding edges not on the rays' lines.
+ *  v1.4.25 (B1): correct edge stripping (see the file header). A blocker on
+ *  a stripped square can never hide anything — the attack set for any
+ *  occupancy is identical with or without it — so the smaller mask is
+ *  bit-exact AND 10.24x smaller for the rook tables. */
 Bitboard magicMask(int sq, bool rook) {
     Bitboard ray = slidingAttacks(sq, 0, rook ? DIRS_R : DIRS_B);
-    Bitboard edges = (RANKS_BB[0] | RANKS_BB[7] | FILES_BB[0] | FILES_BB[7]) &
-                     ~(RANKS_BB[rankOf(sq)] | FILES_BB[fileOf(sq)]);
+    Bitboard edges = ((RANKS_BB[0] | RANKS_BB[7]) & ~RANKS_BB[rankOf(sq)]) |
+                     ((FILES_BB[0] | FILES_BB[7]) & ~FILES_BB[fileOf(sq)]);
     return ray & ~edges;
 }
 
@@ -86,9 +128,8 @@ std::vector<Bitboard> allSubsets(Bitboard mask) {
     return out;
 }
 
-bool findMagic(int sq, bool rook, uint64_t &rng,
-               Bitboard &maskOut, Bitboard &magicOut, int &shiftOut,
-               Bitboard *&tableOut) {
+bool findMagic(int sq, bool rook, uint64_t &rng, MagicSlot &slot,
+               Bitboard *pool, size_t &poolCursor, size_t poolSize) {
     Bitboard mask = magicMask(sq, rook);
     int bits = popcount(mask);
     int shift = 64 - bits;
@@ -115,11 +156,16 @@ bool findMagic(int sq, bool rook, uint64_t &rng,
             }
         }
         if (ok) {
-            maskOut = mask;
-            magicOut = magic;
-            shiftOut = shift;
-            tableOut = new Bitboard[size];
-            std::copy(used.begin(), used.end(), tableOut);
+            // v1.4.25 (B1): copy into the contiguous pool instead of a
+            // fragmented new[] block (unreachable overflow guard).
+            if (poolCursor + size > poolSize) __builtin_trap();
+            slot.mask = mask;
+            slot.magic = magic;
+            slot.shift = (unsigned)shift;
+            slot.pad = 0;
+            slot.attacks = pool + poolCursor;
+            std::copy(used.begin(), used.end(), slot.attacks);
+            poolCursor += size;
             return true;
         }
     }
@@ -130,32 +176,46 @@ bool findMagic(int sq, bool rook, uint64_t &rng,
 
 #if defined(TACTURN_PEXT_DISPATCH)
 // ---- BMI2 / PEXT dense attack tables ----
-// These live at `tacturn::` scope: bitboard.h declares them and the inline
-// attack getters call them directly.
+// v1.4.25 (B1): PextSlot descriptors over ONE contiguous static pool per
+// piece (the old layout held 128 separate new[] blocks + four parallel
+// per-square arrays). With global __BMI2__ the inline lookups in
+// bitboard.h read these slots directly; without it, the out-of-line
+// target("bmi2") thunks below do (runtime-dispatch builds only).
+
 namespace {
 
-Bitboard *PEXT_ROOK_TAB[64];
-Bitboard *PEXT_BISHOP_TAB[64];
+alignas(64) Bitboard PEXT_ROOK_POOL[ROOK_POOL_SIZE];
+alignas(64) Bitboard PEXT_BISHOP_POOL[BISHOP_POOL_SIZE];
 
 /** Build the dense PEXT tables (needs the BMI2 target so _pext_u64 compiles
- *  without global -mbmi2). One entry per relevant-occupancy subset. */
+ *  without global -mbmi2). One entry per relevant-occupancy subset.
+ *  v1.4.25 (B1): writes the exported PextSlot descriptors directly (the
+ *  whole init runs under std::call_once, so concurrent first-use Position
+ *  constructors are already serialized). */
 __attribute__((target("bmi2")))
 void buildPextTables() {
+    size_t rCursor = 0, bCursor = 0;
     for (int sq = 0; sq < 64; sq++) {
-        Bitboard rMask = ROOK_MASK[sq], bMask = BISHOP_MASK[sq];
+        Bitboard rMask = ROOK_MAGICS[sq].mask, bMask = BISHOP_MAGICS[sq].mask;
         int rBits = popcount(rMask), bBits = popcount(bMask);
-        PEXT_ROOK_TAB[sq] = new Bitboard[1ULL << rBits];
-        PEXT_BISHOP_TAB[sq] = new Bitboard[1ULL << bBits];
+        if (rCursor + (size_t)(1ULL << rBits) > ROOK_POOL_SIZE) __builtin_trap();
+        if (bCursor + (size_t)(1ULL << bBits) > BISHOP_POOL_SIZE) __builtin_trap();
+        Bitboard *rTab = PEXT_ROOK_POOL + rCursor;
+        Bitboard *bTab = PEXT_BISHOP_POOL + bCursor;
+        PEXT_ROOK[sq].mask = rMask;
+        PEXT_ROOK[sq].attacks = rTab;
+        PEXT_BISHOP[sq].mask = bMask;
+        PEXT_BISHOP[sq].attacks = bTab;
+        rCursor += 1ULL << rBits;
+        bCursor += 1ULL << bBits;
         Bitboard sub = 0;
         do {
-            PEXT_ROOK_TAB[sq][_pext_u64(sub, rMask)] =
-                slidingAttacks(sq, sub, DIRS_R);
+            rTab[_pext_u64(sub, rMask)] = slidingAttacks(sq, sub, DIRS_R);
             sub = (sub - rMask) & rMask;
         } while (sub);
         sub = 0;
         do {
-            PEXT_BISHOP_TAB[sq][_pext_u64(sub, bMask)] =
-                slidingAttacks(sq, sub, DIRS_B);
+            bTab[_pext_u64(sub, bMask)] = slidingAttacks(sq, sub, DIRS_B);
             sub = (sub - bMask) & bMask;
         } while (sub);
     }
@@ -163,16 +223,19 @@ void buildPextTables() {
 
 }  // namespace
 
+PextSlot PEXT_ROOK[64];
+PextSlot PEXT_BISHOP[64];
+
 bool pextAttacksEnabled = false;
 
 __attribute__((target("bmi2")))
 Bitboard pextRookAttacks(int sq, Bitboard occ) {
-    return PEXT_ROOK_TAB[sq][_pext_u64(occ, ROOK_MASK[sq])];
+    return PEXT_ROOK[sq].attacks[_pext_u64(occ, PEXT_ROOK[sq].mask)];
 }
 
 __attribute__((target("bmi2")))
 Bitboard pextBishopAttacks(int sq, Bitboard occ) {
-    return PEXT_BISHOP_TAB[sq][_pext_u64(occ, BISHOP_MASK[sq])];
+    return PEXT_BISHOP[sq].attacks[_pext_u64(occ, PEXT_BISHOP[sq].mask)];
 }
 #endif  // TACTURN_PEXT_DISPATCH
 
@@ -236,6 +299,10 @@ void initTables() {
         }
 
         CASTLE_RIGHTS_MASK[sq] = 15;
+
+        // v1.4.25 (B2): empty-board pseudo rays for the gating call sites.
+        ROOK_PSEUDO[sq] = slidingAttacks(sq, 0, DIRS_R);
+        BISHOP_PSEUDO[sq] = slidingAttacks(sq, 0, DIRS_B);
     }
 
     CASTLE_RIGHTS_MASK[4] = 15 & ~(CASTLE_WK | CASTLE_WQ);   // e1
@@ -258,7 +325,8 @@ void initTables() {
         for (int k = r; k < 8; k++) RANKS_GE[r] |= RANKS_BB[k];
     }
 
-    // ---- Zobrist keys (deterministic) ----
+    // ---- Zobrist keys (deterministic; independent of the magic search
+    // stream, so the table fix cannot move a single key) ----
     uint64_t rng = 0x5EEDBEEF1234C0DEULL;
     for (int p = 0; p < 12; p++)
         for (int sq = 0; sq < 64; sq++) Z_PIECE[p][sq] = splitmix64(rng);
@@ -266,27 +334,36 @@ void initTables() {
     for (int i = 0; i < 8; i++) Z_EP_FILE[i] = splitmix64(rng);
     Z_SIDE = splitmix64(rng);
 
-    // ---- Magic bitboards (deterministic search) ----
+    // ---- Magic bitboards (deterministic search; v1.4.25 B1 pools) ----
     uint64_t magicRng = 0x1F2E3D4C5B6A7988ULL;
+    size_t rCursor = 0, bCursor = 0;
     for (int sq = 0; sq < 64; sq++) {
-        if (!findMagic(sq, true, magicRng, ROOK_MASK[sq], ROOK_MAGIC_N[sq],
-                       ROOK_SHIFT[sq], ROOK_ATT[sq])) {
+        if (!findMagic(sq, true, magicRng, ROOK_MAGICS[sq],
+                       ROOK_ATT_POOL, rCursor, ROOK_POOL_SIZE)) {
             __builtin_trap();  // unreachable in practice
         }
     }
     for (int sq = 0; sq < 64; sq++) {
-        if (!findMagic(sq, false, magicRng, BISHOP_MASK[sq], BISHOP_MAGIC_N[sq],
-                       BISHOP_SHIFT[sq], BISHOP_ATT[sq])) {
+        if (!findMagic(sq, false, magicRng, BISHOP_MAGICS[sq],
+                       BISHOP_ATT_POOL, bCursor, BISHOP_POOL_SIZE)) {
             __builtin_trap();
         }
     }
 
     // ---- BMI2 / PEXT dispatch (x86-64 only; decided once) ----
+    // v1.4.25 (B1): with compile-time __BMI2__ the inline lookups in
+    // bitboard.h consume these slots directly, so the tables are built
+    // unconditionally; runtime dispatch builds keep the cpu_supports gate.
 #if defined(TACTURN_PEXT_DISPATCH)
+#if defined(__BMI2__)
+    buildPextTables();
+    pextAttacksEnabled = true;
+#else
     if (__builtin_cpu_supports("bmi2")) {
         buildPextTables();
         pextAttacksEnabled = true;
     }
+#endif
 #endif
     });  // call_once
 }

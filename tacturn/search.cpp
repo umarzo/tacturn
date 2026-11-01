@@ -21,6 +21,8 @@
 #elif defined(__AVX2__)
 #include <immintrin.h>
 #define TACTURN_AVX2 1
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 
 #if defined(__ANDROID__)
@@ -150,6 +152,64 @@ static inline int argMaxScores(const int32_t *s, int from, int count) {
             if (s[j] == m) return j;
         return from;  // unreachable (m is attained by construction)
     }
+#elif defined(TACTURN_AVX2)
+    // v1.4.24 (L1): the AVX2/NEON hosts fell through to the scalar loop —
+    // TACTURN_AVX2 was defined but never used. Same two-pass invariant as
+    // the AVX-512 path: (1) reduce the max across 8-lane vectors, (2) scan
+    // ascending with cmpeq + movemask + ctz and return the FIRST index
+    // equal to the max. First-strictly-greater semantics of the scalar
+    // loop == first-index-equal-to-max, so the chosen index (and hence
+    // the whole selection-sort displacement dynamics) is bit-identical.
+    if (count - from >= 8) {
+        __m256i vmax = _mm256_loadu_si256((const __m256i *)(const void *)(s + from));
+        int i = from + 8;
+        for (; i + 8 <= count; i += 8)
+            vmax = _mm256_max_epi32(vmax, _mm256_loadu_si256((const __m256i *)(const void *)(s + i)));
+        // Horizontal max of the 8 lanes (128-bit halves then pairwise).
+        __m128i v128 = _mm_max_epi32(_mm256_castsi256_si128(vmax),
+                                     _mm256_extracti128_si256(vmax, 1));
+        v128 = _mm_max_epi32(v128, _mm_shuffle_epi32(v128, _MM_SHUFFLE(1, 0, 3, 2)));
+        v128 = _mm_max_epi32(v128, _mm_shuffle_epi32(v128, _MM_SHUFFLE(2, 3, 0, 1)));
+        int32_t m = _mm_cvtsi128_si32(v128);
+        for (; i < count; i++)
+            if (s[i] > m) m = s[i];
+        // Pass 2: first index in [from, count) equal to m.
+        int j = from;
+        const __m256i vm = _mm256_set1_epi32(m);
+        for (; j + 8 <= count; j += 8) {
+            __m256i eq = _mm256_cmpeq_epi32(
+                _mm256_loadu_si256((const __m256i *)(const void *)(s + j)), vm);
+            int mask = _mm256_movemask_ps(_mm256_castsi256_ps(eq));
+            if (mask) return j + __builtin_ctz((unsigned)mask);
+        }
+        for (; j < count; j++)
+            if (s[j] == m) return j;
+        return from;  // unreachable (m is attained by construction)
+    }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    // v1.4.24 (L1): NEON mirror — 4-lane max reduce, then ascending
+    // equality scan. Bit-exact by the same first-index-of-max invariant.
+    if (count - from >= 4) {
+        int32x4_t vmax = vld1q_s32(s + from);
+        int i = from + 4;
+        for (; i + 4 <= count; i += 4)
+            vmax = vmaxq_s32(vmax, vld1q_s32(s + i));
+        int32x2_t v64 = vmax_s32(vget_low_s32(vmax), vget_high_s32(vmax));
+        int32_t m = vget_lane_s32(vpmax_s32(v64, v64), 0);
+        for (; i < count; i++)
+            if (s[i] > m) m = s[i];
+        int j = from;
+        const int32x4_t vm = vdupq_n_s32(m);
+        for (; j + 4 <= count; j += 4) {
+            uint32x4_t eq = vceqq_s32(vld1q_s32(s + j), vm);
+            uint64x2_t m64 = vreinterpretq_u64_u32(eq);
+            if (vgetq_lane_u64(m64, 0)) return j + __builtin_ctzll((unsigned long long)vgetq_lane_u64(m64, 0)) / 32;
+            if (vgetq_lane_u64(m64, 1)) return j + 2 + __builtin_ctzll((unsigned long long)vgetq_lane_u64(m64, 1)) / 32;
+        }
+        for (; j < count; j++)
+            if (s[j] == m) return j;
+        return from;  // unreachable (m is attained by construction)
+    }
 #else
     (void)s; (void)from; (void)count;
 #endif
@@ -219,24 +279,64 @@ inline bool givesCheckQuiet(const Position &b, Move m) {
         if (KNIGHT_ATT[to] & kingBb) return true;
         break;
     case BISHOP:
-        if (bishopAttacks(to, occAfter) & kingBb) return true;
+        // v1.4.25 (B2): sliderAttacks(to, occ) is a subset of the
+        // empty-board ray, so the king bit must intersect the pseudo ray
+        // or the table lookup cannot hit it — gate the lookup.
+        if (kingBb & BISHOP_PSEUDO[to]) {
+            if (bishopAttacks(to, occAfter) & kingBb) return true;
+        }
         break;
     case ROOK:
-        if (rookAttacks(to, occAfter) & kingBb) return true;
+        // v1.4.25 (B2): pseudo-ray gate (see the bishop case).
+        if (kingBb & ROOK_PSEUDO[to]) {
+            if (rookAttacks(to, occAfter) & kingBb) return true;
+        }
         break;
-    case QUEEN:
-        if ((bishopAttacks(to, occAfter) | rookAttacks(to, occAfter)) & kingBb)
-            return true;
+    case QUEEN: {
+        // v1.4.25 (B2): each ray's lookup gated on its own pseudo ray.
+        Bitboard bRay = kingBb & BISHOP_PSEUDO[to];
+        Bitboard rRay = kingBb & ROOK_PSEUDO[to];
+        if (bRay | rRay) {
+            Bitboard att = (bRay ? bishopAttacks(to, occAfter) : 0) |
+                           (rRay ? rookAttacks(to, occAfter) : 0);
+            if (att & kingBb) return true;
+        }
         break;
+    }
     case KING:
         break;  // a king never directly checks
     }
 
+    // v1.4.27 (B2): discovered-check ray gate on the VACATED square. The
+    // sliders below only detect checks UNCOVERED by vacating `from`: the
+    // enemy king was not attacked by us before the move (legality), the
+    // only occupancy DECREASE is bitOf(from), and landing on `to` can only
+    // block rays — so an uncovered slider check requires `from` to sit on
+    // the enemy king's rook ray (rank/file) or bishop ray (diagonal). When
+    // `from` is on neither pseudo ray (~75% of quiets) both slider tests
+    // provably cannot fire and the two attack-table lookups (and the rq/bq
+    // constructions) are skipped entirely. Exactness: the gate is a
+    // NECESSARY condition for the tests below it (fuzzcheck-proven).
+    const Bitboard fromBb = bitOf(from);
+    const Bitboard rPseudoK = ROOK_PSEUDO[ksq];
+    const Bitboard bPseudoK = BISHOP_PSEUDO[ksq];
+    if (!(fromBb & (rPseudoK | bPseudoK))) return false;
     Bitboard sliders = b.pieceBb[QUEEN] & b.colorBb[us];
-    if (rookAttacks(ksq, occAfter) & ((b.pieceBb[ROOK] & b.colorBb[us]) | sliders))
-        return true;
-    if (bishopAttacks(ksq, occAfter) & ((b.pieceBb[BISHOP] & b.colorBb[us]) | sliders))
-        return true;
+    // v1.4.25 (B2): discovered-check sliders gated on the pseudo rays of
+    // the enemy king — an empty intersection with our R/Q (B/Q) proves the
+    // real attack intersection is empty too.
+    if (fromBb & rPseudoK) {
+        Bitboard rq = (b.pieceBb[ROOK] & b.colorBb[us]) | sliders;
+        if (rq & rPseudoK) {
+            if (rookAttacks(ksq, occAfter) & rq) return true;
+        }
+    }
+    if (fromBb & bPseudoK) {
+        Bitboard bq = (b.pieceBb[BISHOP] & b.colorBb[us]) | sliders;
+        if (bq & bPseudoK) {
+            if (bishopAttacks(ksq, occAfter) & bq) return true;
+        }
+    }
     return false;
 }
 
@@ -335,20 +435,11 @@ struct Searcher::Worker {
     static constexpr int CORR_LIMIT = 1024;
     int16_t corrPawn[2][CORR_BUCKETS][384];
     int16_t corrNonPawn[2][2][CORR_BUCKETS][384];
-    // v1.4.10 lever: CONTINUATION correction history. The pawn/non-pawn
-    // tables above key the correction by material PLACEMENT (pawn key /
-    // non-pawn keys); this table keys it by the opponent's last move
-    // (piece-to of stack[ply-1], the exact key space the continuation
-    // ORDERING histories use). The same structural error (static eval
-    // systematically off in a recognizable context) often depends on what
-    // just happened, not only on where the pieces sit: a recapture context,
-    // a piece landing on a fresh outpost square, a threat the eval has not
-    // priced. [stm][prevMovePieceTo * 384 + ownPieceTo] — 2 x 147456 x 2B
-    // = 576 KB per worker. Read in corrSumOnly (all own pieces, like the
-    // other corr tables), taught in updateCorr (same cells, same gravity,
-    // same bonus). POV-clean by the v1.4.7 [stm] keying. Never aged (the
-    // v1.4.5 persistence regime the other corr tables follow).
-    int16_t corrCont[2 * 147456];
+    // (v1.4.24 L7: the v1.4.10 continuation correction table corrCont was
+    // removed — §61-A reverted its reads and writes, leaving 576 KB per
+    // worker allocated, zeroed at construction and on every ucinewgame,
+    // and never touched again. The dead corrContBase() helper went with
+    // it.)
 
     // ---- per-ply buffers ----
     Move movesBuf[MAX_PLY][MAX_MOVES];
@@ -410,6 +501,14 @@ struct Searcher::Worker {
     }
     ECEntry evalCache[1 << EC_BITS];
 
+    /** v1.4.24 (L7): true exactly when the ordering tables are known to be
+     *  all-zero (fresh Worker, or clearHistories() just ran). The first
+     *  prepareAge() after a zeroing skips the 3.1 MB >>= 1 sweep — halving
+     *  zeros is the identity — and clears the latch; every later prepare()
+     *  ages normally. Saves the entire redundant move-1 sweep of every
+     *  game (and of every bench position in a fresh process). */
+    bool historiesZeroed = false;
+
     bool isMain() const { return id == 0; }
 
     Worker() {
@@ -432,8 +531,9 @@ struct Searcher::Worker {
         memset(counterMoves, 0, sizeof(counterMoves));
         memset(corrPawn, 0, sizeof(corrPawn));
         memset(corrNonPawn, 0, sizeof(corrNonPawn));
-        memset(corrCont, 0, sizeof(corrCont));
+        // (v1.4.24 L7: corrCont memset removed with the table.)
         memset(evalCache, 0, sizeof(evalCache));
+        historiesZeroed = true;
     }
 
     // ------------------------------------------------------------------
@@ -496,22 +596,64 @@ struct Searcher::Worker {
      *  (prepareSetup) stays on the caller's thread because it READS the
      *  caller's board while it must not yet be mutated. */
     void prepareAge() {
+        // v1.4.24 (L7): fresh-zeroed tables skip the sweep (see the latch):
+        // >>= 1 over all-zero tables is the identity, so the move-1 sweep
+        // after every ucinewgame / Worker construction is pure waste.
+        if (historiesZeroed) {
+            historiesZeroed = false;
+            return;
+        }
         // Age (soft-decay) the histories instead of wiping them.
         // v1.3: halve instead of quartering. >>= 2 every move discarded
         // 75% of what the tables learned between moves of a game — most
         // of the ordering signal died before it could be reused on the
         // next move. Halving keeps half the signal (the standard aging
         // choice) while still bounding staleness.
+        //
+        // v1.4.27 (H1): SELECTIVE persistence. Only the dense root/flat
+        // tables (mainHist / fromToHist / lowPlyHist, 33.5 KB total) are
+        // aged now. The 3.15 MB of sparse structural / continuation tables
+        // (pawnHist 393,216 cells, followupHist / counterHist / contHist3 /
+        // contHist4 294,912 cells each) stay persistent across the moves of
+        // a game:
+        //   - Signal: those tables are 384x sparser than mainHist — a
+        //     tiny fraction of cells is touched per move, so halving
+        //     them every move decayed learned continuation/pawn values
+        //     by 32x within 5 moves, keeping quietHistoryValue (5 of 6
+        //     terms are ph/fh/ch/c3/c4) far below the hist >= 2500/4200
+        //     LMR de-reduction thresholds.
+        //   - Bounds: gravity() clamps every write to int16, exactly the
+        //     argument that removed corrPawn/corrNonPawn from aging in
+        //     v1.4.5 (HISTORY §42) — Stockfish never ages its sparse
+        //     tables between moves either.
+        //   - Cache: the 3.15 MB sweep evicted the TT / evalCache /
+        //     pawnHash / NNUE weights from L2/L3 right before every
+        //     search; the remaining sweep is 33.5 KB (94x smaller).
+        // clearHistories() still zeroes every table on ucinewgame; each
+        // bench position starts a fresh GameSession (zeroed + latched),
+        // so fixed-depth fingerprints are unchanged.
         for (size_t i = 0; i < sizeof(mainHist) / sizeof(int16_t); i++) mainHist[i] >>= 1;
         for (size_t i = 0; i < sizeof(fromToHist) / sizeof(int16_t); i++) fromToHist[i] >>= 1;
         for (size_t i = 0; i < sizeof(lowPlyHist) / sizeof(int16_t); i++)
             lowPlyHist[i / 4096][i % 4096] >>= 1;
-        for (size_t i = 0; i < sizeof(pawnHist) / sizeof(int16_t); i++) pawnHist[i] >>= 1;
-        for (size_t i = 0; i < sizeof(followupHist) / sizeof(int16_t); i++) followupHist[i] >>= 1;
-        for (size_t i = 0; i < sizeof(counterHist) / sizeof(int16_t); i++) counterHist[i] >>= 1;
-        for (size_t i = 0; i < sizeof(contHist3) / sizeof(int16_t); i++) contHist3[i] >>= 1;
-        for (size_t i = 0; i < sizeof(contHist4) / sizeof(int16_t); i++) contHist4[i] >>= 1;
-        for (size_t i = 0; i < sizeof(captureHist) / sizeof(int16_t); i++) captureHist[i] >>= 1;
+        // v1.4.28 (S1): captureHist rejoins the per-move aging sweep. Unlike
+        // the 294k-393k-cell structural/continuation tables it was lumped
+        // with in v1.4.27 (H1), captureHist is a CONTEXT-FREE dense table:
+        // 2 x 384 x 6 = 4,608 cells (9.2 KB — half of fromToHist, which is
+        // still aged), indexed by [us][piece][to][victim] with no board or
+        // continuation key. A capture malused repeatedly in the opening
+        // therefore accumulates capHist < -8000 and — with no aging — keeps
+        // that value for the REST of the game: the capture LMR gates
+        // (capHist < 0 -> r=1, capHist < -8000 -> r=2) and the scoreMoves /
+        // scoreQMoves capRow[...]/16 ordering permanently demote unrelated
+        // middlegame/endgame captures on the same [piece][to][victim] cells.
+        // Halving per move bounds that carryover exactly as it bounds
+        // mainHist/fromToHist (the dense tables' standard treatment), and
+        // the extra 9.2 KB sweep is L1-resident. Bench positions each start
+        // a fresh GameSession (historiesZeroed latched), so fixed-depth
+        // fingerprints are unchanged.
+        for (size_t i = 0; i < sizeof(captureHist) / sizeof(int16_t); i++)
+            captureHist[i] >>= 1;
         // v1.4.5: corrPawn/corrNonPawn are NO LONGER aged here. Correction
         // history learns slowly across a game and Stockfish never ages it
         // between moves — gravity alone bounds the entries. Halving every
@@ -549,26 +691,44 @@ struct Searcher::Worker {
      *  eval — quiesce computed correctedEval() for standEval and then the
      *  leaf helper recomputed the whole corrhist sum a second time. The
      *  correction sum is the expensive part (3 tables x every piece); the
-     *  pass-through is bit-identical and saves one full sum per eval. */
+     *  pass-through is bit-identical and saves one full sum per eval.
+     *  v1.4.27 (N2): e.res carries the RAW (unblended) residual now; the
+     *  bucket blend is applied HERE with the single-rounding blendScale —
+     *  value-identical to the old pre-blended cache (same rounding rule),
+     *  but the same cached raw value now also feeds the static injection
+     *  and the quiesce TT-hit stand-pat without any un-scale/re-scale. */
     int leafEvalFrom(int corrected) {
         int v = corrected;
         if (!nnue::enabled) return v;
+        int bp = nnue::blendForBucket(
+            nnue::bucketOf(popcount(pos->occupied)));
         ECEntry &e = evalCache[pos->key & EC_MASK];
         if (ecMatch(e, pos->key)) {
-            if (e.res == RES_INVALID16) e.res = (int16_t)nnue::residual(*pos);
-            return v + decayResidual(e.res);
+            if (e.res == RES_INVALID16) e.res = (int16_t)nnue::residualRaw(*pos);
+            return v + decayResidual(blendScale(e.res, bp));
         }
         // (correctedEval() just filled the entry; the guard is defensive)
-        return v + decayResidual(nnue::residual(*pos));
+        return v + decayResidual(blendScale(nnue::residualRaw(*pos), bp));
+    }
+
+    /** v1.4.27 (N2): single-rounding percent blend — round half away from
+     *  zero, the exact arithmetic of nnue::residual()'s blend tail, applied
+     *  at the use site to the RAW cached residual. */
+    static inline int blendScale(int r, int pct) {
+        if (pct == 100) return r;
+        int t = r * pct;
+        return (t >= 0 ? (t + 50) : (t - 50)) / 100;
     }
 
     /** Stand-pat with the residual computed only when it can affect the
      *  cutoff decision. The residual is clamped to +-RES_CLAMP BEFORE the
-     *  blend is applied inside nnue::residual(), so the effective bound is
+     *  blend (nnue::residualRaw), so the effective bound is
      *  RES_CLAMP*blend/100 (+1 for rounding) — far-boundary nodes skip the
      *  inference entirely. Cutoff decisions are exactly preserved;
-     *  far-boundary fail-soft values are returned in HCE terms. */
-    int leafEvalBoundedFrom(int alpha, int beta, int corrected) {
+     *  far-boundary fail-soft values are returned in HCE terms.
+     *  v1.4.27 (N2): takes the caller's ECEntry (quiesce already probed
+     *  it) and caches the RAW residual; the blend happens here. */
+    int leafEvalBoundedFrom(int alpha, int beta, int corrected, ECEntry &e) {
         int v = corrected;
         if (!nnue::enabled) return v;
         // v8: the skip bound must use the bucket's effective blend (the
@@ -578,12 +738,10 @@ struct Searcher::Worker {
             nnue::bucketOf(popcount(pos->occupied)));
         int bound = 1 + (nnue::RES_CLAMP * bp + 99) / 100;
         if (v >= beta + bound || v <= alpha - bound) return v;
-        ECEntry &e = evalCache[pos->key & EC_MASK];
-        if (ecMatch(e, pos->key)) {
-            if (e.res == RES_INVALID16) e.res = (int16_t)nnue::residual(*pos);
-            return v + decayResidual(e.res);
-        }
-        return v + decayResidual(nnue::residual(*pos));
+        if (!ecMatch(e, pos->key))  // defensive (rawEvalCached just filled it)
+            return v + decayResidual(blendScale(nnue::residualRaw(*pos), bp));
+        if (e.res == RES_INVALID16) e.res = (int16_t)nnue::residualRaw(*pos);
+        return v + decayResidual(blendScale(e.res, bp));
     }
 
     int leafEval() { return leafEvalFrom(correctedEval()); }
@@ -603,7 +761,8 @@ struct Searcher::Worker {
     }
 
     int leafEvalBounded(int alpha, int beta) {
-        return leafEvalBoundedFrom(alpha, beta, correctedEval());
+        ECEntry &e = evalCache[pos->key & EC_MASK];
+        return leafEvalBoundedFrom(alpha, beta, correctedEval(), e);
     }
 
     /** v6: the static-eval residual injection (staticBlendPct scaling of
@@ -622,7 +781,7 @@ struct Searcher::Worker {
     //  long-time-control gate someday; it could not prove itself inside
     //  this host's fixed-movetime noise. See HISTORY §41.)
 
-    int staticResidualInject() {
+    int staticResidualInject(ECEntry &e) {
         if (!nnue::enabled || nnue::staticBlendPct == 0) return 0;
         // (v1.4.3 note: caching the RAW residual and applying
         // blendResidual() per use site — including re-scaling the
@@ -631,23 +790,26 @@ struct Searcher::Worker {
         // measured it at roughly -40 Elo. The 72%-vs-77% "mismatch" the
         // third-dev audit flagged is load-bearing: the pruning constants
         // were tuned with TT-hit stand-pats at the static-blend scale.
-        // See HISTORY.md §40.)
-        ECEntry &e = evalCache[pos->key & EC_MASK];
+        // See HISTORY.md §40.) [v1.4.27 N2: that bisect ran under the
+        // SIGN-FLIPPED match.py era (HISTORY §58) — the baseline's Elo
+        // was printed as the candidate's, so "-40" was a +40 gain the
+        // engine never received. The sign-corrected rerun measured the
+        // raw-cache + leaf-blend-consistent scheme POSITIVE; it ships now.]
+        // v1.4.27 (N2): the injection blends the cached RAW residual ONCE
+        // (single rounding, decay applied to the raw value). The old path
+        // un-scaled the cached bucket-blended integer via `t = r*100/bp`
+        // — integer TRUNCATION — then re-scaled to staticBlendPct,
+        // injecting double-rounding noise into every main-search static
+        // eval (and a third rounding whenever the 50-move decay fired on
+        // the already-blended value).
         int r;
         if (ecMatch(e, pos->key)) {
-            if (e.res == RES_INVALID16) e.res = (int16_t)nnue::residual(*pos);
+            if (e.res == RES_INVALID16) e.res = (int16_t)nnue::residualRaw(*pos);
             r = e.res;
         } else {
-            r = nnue::residual(*pos);
+            r = nnue::residualRaw(*pos);
         }
-        r = decayResidual(r);
-        int bp = nnue::blendForBucket(
-            nnue::bucketOf(popcount(pos->occupied)));
-        if (nnue::staticBlendPct == bp) return r;
-        // e.res carries the qsearch blend; rescale for the static injection.
-        int t = r * 100 / (bp == 0 ? 1 : bp);
-        t = t * nnue::staticBlendPct;
-        return (t >= 0 ? (t + 50) : (t - 50)) / 100;
+        return blendScale(decayResidual(r), nnue::staticBlendPct);
     }
 
     int correctedEval() {
@@ -657,20 +819,11 @@ struct Searcher::Worker {
     }
 
     // v1.4.10: the ply of the innermost search frame (set at every
-    // alphaBeta/quiesce entry) — the continuation corr key reads
-    // stack[ply-1], the move that led into this node.
+    // alphaBeta/quiesce entry) — kept for the corrSumOnly signature.
     int corrPly_ = 0;
 
-    /** v1.4.10: the continuation-corr base index for the current node
-     *  (opponent's last move piece-to key), or -1 when there is no
-     *  usable context (root, null-move parent, exotic). */
-    inline int corrContBase(int ply) const {
-        if (ply < 1) return -1;
-        Move p = stack[ply - 1];
-        if (p == MOVE_NONE || movePiece(p) >= 6) return -1;
-        return pos->sideToMove * 147456 +
-               (movePiece(p) * 64 + moveTo(p)) * 384;
-    }
+    // (v1.4.24 L7: corrContBase() removed with the corrCont table — it
+    //  had no callers since the §61-A revert.)
 
     /** v1.4.0 lever: the live correction-history sum alone (no raw eval).
      *  The TT eval field now stores the corrhist-FREE static signal
@@ -682,20 +835,16 @@ struct Searcher::Worker {
      *  table outlives, it is stale by construction). */
     int corrSumOnly(int ply) {
         if (!USE_CORRHIST) return 0;
+        (void)ply;  // (the ply argument remains for signature stability —
+        //             the v1.4.10 continuation table was the only ply user)
         int us = pos->sideToMove;
         int them = us ^ 1;
-        // v1.4.10: continuation table base (opponent's last move context).
-        const int16_t *cT = nullptr;
-        int cBase = corrContBase(ply);
-        if (cBase >= 0) cT = corrCont + cBase;
-        // v1.4.10: the cont correction sums SEPARATELY at HALF the corr
-        // weight — the pawn/non-pawn divisor was tuned for a two-table
-        // sum, and folding a third full-amplitude table into the same
-        // sums over-corrects (bench d9 +23% nodes: evals noisier, pruning
-        // less effective). Half weight keeps the total correction
-        // magnitude inside the tuned envelope while the new context
-        // signal still lands.
-        int contSum = 0;
+        // v1.4.23 EXPERIMENT (HISTORY §61-A): the v1.4.10 continuation
+        // correction-history term is REVERTED (corrCont reads removed
+        // here and in updateCorr; the table stays allocated and zero).
+        // The §59 audit's C1 re-read measured the §46/§47 lever pack at
+        // -20.6 ± 13.4 pooled with the fixed-sign referee; the claimed
+        // "+8.6" was a sign-flipped era reading.
         // v1.4.7: [stm]-keyed tables (see the declaration note) — a cell
         // written by White's search is now only ever read by White's
         // search, in White's POV.
@@ -712,7 +861,6 @@ struct Searcher::Worker {
             int sq = lsb(pw);
             pw &= pw - 1;
             pawnSum += pT[sq];
-            if (cT) contSum += cT[sq];
         }
         Bitboard np = pos->colorBb[us] & ~pos->pieceBb[PAWN];
         while (np) {
@@ -721,23 +869,24 @@ struct Searcher::Worker {
             int idx = (pos->pieceAt[sq] & 7) * 64 + sq;
             pawnSum += pT[idx];
             npSum += nT[idx] + eT[idx];
-            if (cT) contSum += cT[idx];
         }
         // v5.3: divisor exposed as tuning::g.corrWeight (UCI CorrWeight);
         // 1024 = the shipped constant (probed 512 at 50 ms: -26.5 ± 25.7,
         // rejected — the weight is already at its optimum).
-        return pawnSum / p.corrWeight + npSum / p.corrWeight +
-               contSum / (p.corrWeight * 2);
+        return pawnSum / p.corrWeight + npSum / p.corrWeight;
     }
 
-    static inline int16_t corrGravity(int16_t h, int b) {
+    static inline int16_t corrGravity(int16_t h, int b, int ab) {
         // v1.4.5: signed-h gravity (the old |h| * |b| damping broke both
         // negative quadrants: a positive cutoff bonus on a negative entry
         // subtracted from it once |h| > 16384, trapping cells at the clamp
         // until aging; a malus on a negative entry amplified itself).
         // Standard formula: h + b - h * |b| / 16384.
-        int64_t ab = b < 0 ? -(int64_t)b : (int64_t)b;
-        int64_t v = (int64_t)h + b - ((int64_t)h * ab) / 16384;
+        // v1.4.25 (B4): |h| <= CORR_LIMIT (1024) and |b| <= 512, so
+        // |h * ab| <= 524,288 — the whole expression fits 32-bit int and
+        // the hoisted |b| (computed once per updateCorr instead of once
+        // per cell) removes ~30 64-bit divisions per node.
+        int v = (int)h + b - ((int)h * ab) / 16384;
         if (v > CORR_LIMIT) v = CORR_LIMIT;
         if (v < -CORR_LIMIT) v = -CORR_LIMIT;
         return (int16_t)v;
@@ -762,25 +911,25 @@ struct Searcher::Worker {
         int16_t *pT = corrPawn[us][pos->pawnKey & CORR_MASK];
         int16_t *nT = corrNonPawn[us][us][pos->nonPawnKey[us] & CORR_MASK];
         int16_t *eT = corrNonPawn[us][them][pos->nonPawnKey[them] & CORR_MASK];
-        // v1.4.10: continuation cells for THIS node's context (may be null).
-        int cBase = corrContBase(ply);
-        int16_t *cT = cBase >= 0 ? corrCont + cBase : nullptr;
+        // (v1.4.10 continuation cells removed — §61-A revert; the corrCont
+        // table is no longer written, matching the removed reads in
+        // corrSumOnly.)
+        // v1.4.25 (B4): |bonus| hoisted — corrGravity takes it precomputed.
+        int ab = bonus < 0 ? -bonus : bonus;
         Bitboard pw = pos->colorBb[us] & pos->pieceBb[PAWN];
         while (pw) {
             int sq = lsb(pw);
             pw &= pw - 1;
-            pT[sq] = corrGravity(pT[sq], bonus);
-            if (cT) cT[sq] = corrGravity(cT[sq], bonus);
+            pT[sq] = corrGravity(pT[sq], bonus, ab);
         }
         Bitboard np = pos->colorBb[us] & ~pos->pieceBb[PAWN];
         while (np) {
             int sq = lsb(np);
             np &= np - 1;
             int idx = (pos->pieceAt[sq] & 7) * 64 + sq;
-            pT[idx] = corrGravity(pT[idx], bonus);
-            nT[idx] = corrGravity(nT[idx], bonus);
-            eT[idx] = corrGravity(eT[idx], bonus);
-            if (cT) cT[idx] = corrGravity(cT[idx], bonus);
+            pT[idx] = corrGravity(pT[idx], bonus, ab);
+            nT[idx] = corrGravity(nT[idx], bonus, ab);
+            eT[idx] = corrGravity(eT[idx], bonus, ab);
         }
     }
 
@@ -806,14 +955,23 @@ struct Searcher::Worker {
         updateCorr(ply, depth, bestScore - staticEval);
     }
 
-    /** v1.4.7: full history/correction/eval-cache reset for ucinewgame.
+    /** v1.4.7: full history/correction reset for ucinewgame.
      *  Since v1.4.5 the correction tables persist across MOVES by design
      *  (prepareAge no longer ages them), so a new game in a persistent
      *  process needs an explicit wipe — clearTable() used to clear only
      *  the TT, letting one game's learned corrections leak into the next
-     *  through recycled workers. Zeroes exactly the tables the Worker
-     *  constructor zeroes, so a cleared worker is bit-identical to a
-     *  fresh one. */
+     *  through recycled workers.
+     *
+     *  v1.4.24 (S1): the evalCache is NO LONGER wiped here. Its entries
+     *  are a pure function of pos->key (raw HCE score + raw NNUE
+     *  residual; the 50-move residual decay is applied dynamically at the
+     *  reader via decayResidual(), and the HCE long-hmc decay only fires
+     *  past halfmove 64 — the same staleness exposure the cache already
+     *  accepts between moves of one game). Keeping it warm across games
+     *  matches the pawnHash treatment (never cleared here either) and
+     *  preserves valid opening/early-middlegame evals between the games
+     *  of a persistent-process match. Learned tables (ordering
+     *  histories, corrhist) are still wiped. */
     void clearHistories() {
         memset(mainHist, 0, sizeof(mainHist));
         memset(fromToHist, 0, sizeof(fromToHist));
@@ -827,8 +985,9 @@ struct Searcher::Worker {
         memset(counterMoves, 0, sizeof(counterMoves));
         memset(corrPawn, 0, sizeof(corrPawn));
         memset(corrNonPawn, 0, sizeof(corrNonPawn));
-        memset(corrCont, 0, sizeof(corrCont));
-        memset(evalCache, 0, sizeof(evalCache));
+        // (v1.4.24 L7: corrCont memset removed with the table;
+        //  v1.4.24 S1: evalCache memset removed — see the note above.)
+        historiesZeroed = true;
     }
 
     inline void checkStop() {
@@ -969,17 +1128,44 @@ struct Searcher::Worker {
                     // iteration. Absolute form:
                     hardDeadline = deadlineAt(startMs + tm->iterationCapMs(completedDepth));
                 } else if (limits.hardMoveTimeMs <= 0) {
-                    // Fixed movetime: start an iteration whenever it is
-                    // expected to fit in the REMAINING budget — the full
-                    // budget, not 95% of it. Unspent time cannot be banked,
-                    // and the old 95% margin refused exactly the borderline
-                    // deep iterations that would have completed in time,
-                    // wasting 17-23% of every `go movetime` budget. Estimate
-                    // misses (aspiration re-search cascades) are caught by
-                    // the hard wall-clock deadline: the overrunning iteration
-                    // is aborted and the last completed move is used.
-                    int64_t estMs = estMsFor(lastIterMs, gap);
-                    if (elapsedMs + estMs > moveTimeMs) break;
+                    // v1.4.26 (T2): fixed movetime now runs to the budget's
+                    // END. The old form refused to start iteration d+1
+                    // unless estMs = 1.3 x lastIterMs fit in the remaining
+                    // budget — but unspent milliseconds in `go movetime`
+                    // CANNOT be banked, so whenever iteration d finished
+                    // between 50% and 77% of the budget (estMs = 1.3x means
+                    // the break fires when the next iteration would end
+                    // past 100%), the remaining 23-31% was simply thrown
+                    // away (measured: 77.3% of a 30 ms budget, 68.7% of a
+                    // 50 ms budget). Starting the iteration anyway is
+                    // strictly better: either it COMPLETES (a full extra
+                    // ply of depth), or the hard wall (msToDeadline of the
+                    // full budget, checked every 512 nodes in checkStop)
+                    // aborts it — and the partial-iteration salvage below
+                    // keeps any move that overtook the incumbent at depth
+                    // d+1 while the completed-depth evidence and the
+                    // TT/histories the aborted pass wrote remain for the
+                    // next move. The only cost is the aborted iteration's
+                    // bounded overshoot (<= the 512-node check granularity).
+                    //
+                    // v1.4.27 (N5): doomed-iteration guard, corrected form.
+                    // The v1.4.27-cand form (elapsed + lastIterMs/2 > budget
+                    // → stop) gated on the cost of re-searching rootMoves[0]
+                    // and bought abort-overshoot protection — but it also
+                    // killed the 30-50%-of-budget tail where T2's ply gain
+                    // lives. The fixed-node A/B re-measurement says the true
+                    // doom line is much lower: when < 20% of lastIterMs
+                    // remains (elapsed + lastIterMs/5 >= moveTimeMs at
+                    // completedDepth >= 6), starting depth+1 has ~0% chance
+                    // of finishing even rootMoves[0] — it can never produce a
+                    // NEW best move, only the 512-node deadline overshoot
+                    // and history/killer mutation on an aborted subtree.
+                    // Immature iterations (completedDepth < 6, or
+                    // lastIterMs < 5 ms of noise) keep the pure T2 wall —
+                    // their iterations are cheap and often finish.
+                    int64_t minNeedMs =
+                        (completedDepth >= 6 && lastIterMs >= 5) ? (lastIterMs / 5) : 0;
+                    if (elapsedMs + minNeedMs >= moveTimeMs) break;
                 } else {
                     // Explicit soft/hard split (Android skill levels, analysis
                     // budgets): keep the conservative soft pacing (95% of the
@@ -1093,6 +1279,15 @@ struct Searcher::Worker {
                 // (or when only fail-low upper-bound evidence exists — see
                 // the guard in searchRoot).
                 if (iterationBestMove != MOVE_NONE) {
+                    // v1.4.27 (S1c): a salvaged publication that CHANGES the
+                    // pick is backed by a completed depth-d search of that
+                    // move (the abort-path publication guard requires
+                    // best > alphaIn — a genuine above-window proof at this
+                    // depth), so the iteration counts as completed for
+                    // result.depth and the caller's depth-keyed records. A
+                    // salvage that merely re-confirms the incumbent keeps
+                    // the conservative completed-depth bookkeeping.
+                    if (iterationBestMove != bestMove) completedDepth = depth;
                     bestMove = iterationBestMove;
                     bestScore = iterationBestScore;
                 }
@@ -1151,6 +1346,11 @@ struct Searcher::Worker {
         // before completing any move, the salvage path must still publish
         // that move instead of falling back to the previous depth's pick.
         // Early completion of rootMoves[0] re-publishes naturally.
+        // v1.4.27 (S1b): remember whether a preserved fail-high publication
+        // was alive on entry — the normal-exit path below needs it to decide
+        // between clearing (fail-low after a refuted fail-high) and the
+        // historical publish.
+        const bool preservedFromFailHigh = iterationBestPreserve;
         if (!iterationBestPreserve) iterationBestMove = MOVE_NONE;
         iterationBestPreserve = false;
 
@@ -1210,6 +1410,18 @@ struct Searcher::Worker {
                 // v1.4.7: a completed scout's proof counts as "fully
                 // searched" depth-d evidence for exactly the same reason —
                 // it is a LOWER bound above every earlier move's bound.
+                //
+                // v1.4.27 (S1a-corrected): the initially proposed guard
+                // `scoutProof > best && bestLocal == MOVE_NONE` was measured
+                // in a 90-game 8,000-node A/B at −23.2 Elo vs +27.1 for the
+                // plain form: i == 0 (rootMoves[0]) always sets bestLocal,
+                // so bestLocal == MOVE_NONE is false for every i >= 1 and the
+                // guard silently disabled the v1.4.7 salvage entirely. The
+                // salvage stays UNCONDITIONAL; the fail-high → fail-low
+                // pathology is handled where it actually occurs (S1b below —
+                // a fail-low pass entered with a preserved fail-high
+                // publication clears it instead of leaving a refuted proof
+                // for a later abort path to publish).
                 if (scoutProof > best) {
                     best = scoutProof;
                     bestLocal = move;
@@ -1217,6 +1429,25 @@ struct Searcher::Worker {
                 if (bestLocal != MOVE_NONE && best > alphaIn) {
                     iterationBestMove = bestLocal;
                     iterationBestScore = best;
+                } else if (preservedFromFailHigh && i > 0) {
+                    // v1.4.28 (S2): partial-abort fail-high -> fail-low
+                    // salvage fix. S1b (below) clears the preserved
+                    // fail-high publication only on the NORMAL (complete)
+                    // fail-low exit. When the re-search instead ABORTS at
+                    // i >= 1 after rootMoves[0] — the promoted fail-high
+                    // move — completed at i == 0 with best <= alphaIn (the
+                    // proof is already REFUTED at re-search depth), the
+                    // guard above does nothing and the stale rootMoves[0]
+                    // stays in iterationBestMove for THIS return path's
+                    // caller — the ID loop's abort handler publishes it
+                    // over the previous completed iteration's sound pick.
+                    // Clear the slot: i > 0 means rootMoves[0] finished and
+                    // failed to beat the window floor, so the preserve has
+                    // no surviving depth-d evidence. An abort DURING
+                    // rootMoves[0] (i == 0) keeps the preserve — the
+                    // fail-high pass genuinely proved >= beta at this
+                    // depth. Fixed-depth searches never abort here.
+                    iterationBestMove = MOVE_NONE;
                 }
                 return best;
             }
@@ -1273,8 +1504,28 @@ struct Searcher::Worker {
             }
         }
 
-        iterationBestMove = bestLocal;
-        iterationBestScore = best;
+        // v1.4.27 (S1b): aspiration fail-high → fail-low salvage fix. When
+        // THIS pass was entered with a preserved fail-high publication
+        // (iterationBestPreserve was set by the fail-high break — the pass
+        // that proved a move >= beta at this depth) and the pass then
+        // completes FAIL LOW (best <= alphaIn — every root score is an
+        // inexact upper bound), the preserved proof has been contradicted at
+        // re-search depth: leaving it in place would let a later aborted
+        // pass's salvage path publish the STALE fail-high move over the
+        // previous completed iteration's sound pick, and publishing the
+        // fail-low argmax instead feeds that same path a junk move. Clear
+        // the slot entirely — the ID loop's abort path then falls back to
+        // the previous completed iteration's bestMove, which carries exact
+        // completed-depth evidence. Fail-low passes NOT preceded by a
+        // preserve publish their argmax exactly as before (the next pass's
+        // entry clear makes that publication transient by construction);
+        // in-window and full-window passes are untouched.
+        if (preservedFromFailHigh && best <= alphaIn) {
+            iterationBestMove = MOVE_NONE;
+        } else {
+            iterationBestMove = bestLocal;
+            iterationBestScore = best;
+        }
         int flag = best >= beta   ? TranspositionTable::FLAG_LOWER
                    : best <= alphaIn ? TranspositionTable::FLAG_UPPER
                                      : TranspositionTable::FLAG_EXACT;
@@ -1338,6 +1589,21 @@ struct Searcher::Worker {
             return drawScore(ply);
         }
 
+        // v1.4.26 (B4): the depth <= 0 handoff moved up from its old spot
+        // below the pvNode/inCheck lines. Everything it used to pre-run is
+        // repeated verbatim at the top of quiesce — the mate-distance
+        // clamps (quiesce applies the identical bounds to its own copies,
+        // and the clamp can never close a window at ply < MAX_PLY), the
+        // pvNode flag (unused at depth <= 0) and the checkers() probe — so
+        // those are pure dead work on the ~525k depth<=0 entries of a
+        // bench-14 run. The DRAW adjudication deliberately stays ABOVE the
+        // handoff: a depth<=0 draw node returned drawScore from alphaBeta
+        // WITHOUT entering quiesce, and node counting (checkStop in
+        // alphaBeta vs quiesce) is part of the bench fingerprint — moving
+        // the draw check below the handoff would double-count every such
+        // node and shift bench totals. Order: draws -> handoff -> clamps.
+        if (depth <= 0) return quiesce(alphaIn, betaIn, ply, 0);
+
         // Mate-distance pruning.
         if (alpha < -MATE + ply) alpha = -MATE + ply;
         if (beta > MATE - ply - 1) beta = MATE - ply - 1;
@@ -1345,11 +1611,6 @@ struct Searcher::Worker {
 
         bool pvNode = beta - alpha > 1;
         bool inCheck = pos->checkers() != 0;
-
-        // Check-evasion depth: no unconditional check extension — singular
-        // extensions carry forced lines; unconditional extension mostly
-        // explodes the tree. (v2.3 ladder test: removed.)
-        if (depth <= 0) return quiesce(alpha, beta, ply, 0);
 
         // ---- Transposition table ----
         Move ttMove = MOVE_NONE;
@@ -1386,66 +1647,13 @@ struct Searcher::Worker {
             (ttMove == MOVE_NONE || ttDepth < depth - 6))
             depth--;
 
-        // ---- Singular extension / multi-cut ----
+        // v1.4.26 (S1): the Singular Extension block moved BELOW ProbCut
+        // (immediately before the move loop) — see its new home. The
+        // variables stay declared here: `singular`/`singularExt` are only
+        // consumed by the move loop, and the flags survive the relocation
+        // untouched.
         bool singular = false;
         int singularExt = 0;
-        if (excludedMove == MOVE_NONE && depth >= 4 && ttMove != MOVE_NONE && !inCheck &&
-            (ttFlag == TranspositionTable::FLAG_LOWER ||
-             ttFlag == TranspositionTable::FLAG_EXACT) &&
-            ttDepth >= depth - 4) {
-            int ttScoreAdj = scoreFromTT(ttScoreRaw, ply);
-            // v1.4.7 fix (mate-bound guard): a mate-score TT entry makes
-            // singularBeta = ttScore - 2*depth a nonsense mate-distance
-            // threshold, firing spurious excluded verification searches
-            // throughout mate trees (and very rarely a bogus singular
-            // extension when the exclusion is even more mate-ish). Gate
-            // the whole singular block on a non-mate TT score, the
-            // Stockfish treatment.
-            if (ttScoreAdj > -Searcher::MATE_BOUND && ttScoreAdj < Searcher::MATE_BOUND) {
-            int singularBeta = ttScoreAdj - 2 * depth;
-            // v1.1: the excluded verification now also runs when the TT
-            // score sits far ABOVE beta (singularBeta >= beta) — the
-            // precondition under which the multi-cut refutation is
-            // reachable. The old code gated the whole block on
-            // beta > singularBeta, which made the multi-cut branch below
-            // DEAD CODE for its entire life (mutually exclusive
-            // conditions — see HISTORY v4.0 note). The re-gated form:
-            //   - beta > singularBeta: singular-extension verification
-            //     (unchanged behavior);
-            //   - !pvNode && singularBeta >= beta: multi-cut branch. v1.1.0
-            //     made this reachable for the first time; v1.1.1 disables it
-            //     again after direct measurement: on the full 1.1.0 stack the
-            //     multi-cut return cost ~41 Elo of head-to-head swing (the
-            //     TT age-wrap fix was in/out at the same time, isolated by
-            //     A/B matches). The excluded search still runs below for the
-            //     singularBeta >= beta case via singularSearch only when
-            //     beta > singularBeta; the >= beta case now skips the block
-            //     entirely (identical to the pre-1.1 unreachable form).
-            bool singularSearch = beta > singularBeta;
-            bool multicutSearch = false;  // v1.1.1: measured regression, off
-            if (singularSearch || multicutSearch) {
-                int excludedScore =
-                    alphaBeta((depth - 1) / 2, singularBeta - 1, singularBeta, ply, false,
-                              cutNode, ttMove);
-                if (stopped()) return 0;
-                if (excludedScore < singularBeta) {
-                    if (singularSearch) {
-                        singular = true;
-                        if (USE_DOUBLE_EXT && ttFlag == TranspositionTable::FLAG_EXACT &&
-                            excludedScore < singularBeta - DOUBLE_EXT_MARGIN && !isCapture(ttMove))
-                            singularExt = 2;
-                        else
-                            singularExt = 1;
-                    }
-                } else if (false && multicutSearch && excludedScore < MATE_BOUND) {
-                    return singularBeta;  // multi-cut: dead again (v1.1.1)
-                }
-                // (v1.2 tested: TT-move negative extension when not
-                // singular & score >= beta LOST -17.4 ± 6.4 — the 48%
-                // tree shrink cost more tactical depth than it saved.)
-            }
-            }
-        }
 
         int staticEval;
         // v1.4.0 lever: what this node's TT stores carry as the eval — the
@@ -1457,6 +1665,18 @@ struct Searcher::Worker {
         int ttEvalStore;
         if (inCheck) {
             staticEval = -INFINITE;
+            ttEvalStore = TranspositionTable::EVAL_NONE;
+        } else if (excludedMove != MOVE_NONE) {
+            // v1.4.26 (S1): an excluded (singular-verification) search runs
+            // at the SAME ply on the SAME board as its caller, and the
+            // caller — which sits at the same corrhist state (no search has
+            // run at this node between its staticEval and the SE call now
+            // that SE lives after ProbCut) — already published the exact
+            // value into evalStack[ply]. Reusing it removes the redundant
+            // rawEvalCached + corrSumOnly + staticResidualInject pass the
+            // child used to pay (~5.7k calls per bench 14). The value is
+            // bit-identical to the child's own computation.
+            staticEval = evalStack[ply];
             ttEvalStore = TranspositionTable::EVAL_NONE;
         } else if (ttEval != TranspositionTable::EVAL_NONE) {
             // v1.4.0: stored raw+residual + the CURRENT correction sum.
@@ -1471,15 +1691,20 @@ struct Searcher::Worker {
             // re-ran their EC probes on the very next line). All three
             // helpers are pure/idempotent, so this is bit-identical.
             int rawV = rawEvalCached();
-            int resV = staticResidualInject();
+            ECEntry &eRes = evalCache[pos->key & EC_MASK];
+            int resV = staticResidualInject(eRes);
             staticEval = (USE_CORRHIST ? rawV + corrSumOnly(ply) : rawV) + resV;
             ttEvalStore = rawV + resV;
-            owner->tt_.storeEval(pos->key, ttEvalStore);
+            // v1.4.27 (B2): storeEval only fills the eval of an EXISTING
+            // same-key TT entry. Without a TT hit this pass the 4-slot
+            // cluster scan is a guaranteed miss (~100k wasted scans per
+            // bench 14) — gate it on the probe result. Bit-exact.
+            if (ttHit) owner->tt_.storeEval(pos->key, ttEvalStore);
         } else {
             int rawV = rawEvalCached();
             staticEval = USE_CORRHIST ? rawV + corrSumOnly(ply) : rawV;
             ttEvalStore = rawV;
-            owner->tt_.storeEval(pos->key, ttEvalStore);
+            if (ttHit) owner->tt_.storeEval(pos->key, ttEvalStore);  // v1.4.27 (B2)
         }
         // In-check plies carry no eval: store a sentinel instead of
         // -INFINITE (v4.0). The old -INFINITE store made any later finite
@@ -1510,22 +1735,46 @@ struct Searcher::Worker {
         int evalPrune = staticEval;
         if (ttHit && !inCheck) {
             int tv = scoreFromTT(ttScoreRaw, ply);
-            if (ttFlag == TranspositionTable::FLAG_EXACT) {
-                evalPrune = tv;
-            } else if (ttFlag == TranspositionTable::FLAG_LOWER && tv > evalPrune) {
-                evalPrune = tv;
-            } else if (ttFlag == TranspositionTable::FLAG_UPPER && tv < evalPrune) {
-                evalPrune = tv;
+            // v1.4.26 (S1, bug 1D): a MATE-range TT bound may not refine
+            // evalPrune. The old form let a shallow mate lower bound (|tv|
+            // >= MATE_BOUND) overwrite evalPrune wholesale, after which
+            // RFP's `evalPrune - margin*depth >= beta` returned an unproven
+            // MATE SCORE without searching a single move — the TT cutoff
+            // above requires ttDepth >= depth for exactly this reason, but
+            // the evalPrune path had no such guard. Skip the refinement on
+            // mate bounds (the Stockfish treatment).
+            if (tv > -Searcher::MATE_BOUND && tv < Searcher::MATE_BOUND) {
+                if (ttFlag == TranspositionTable::FLAG_EXACT) {
+                    evalPrune = tv;
+                } else if (ttFlag == TranspositionTable::FLAG_LOWER && tv > evalPrune) {
+                    evalPrune = tv;
+                } else if (ttFlag == TranspositionTable::FLAG_UPPER && tv < evalPrune) {
+                    evalPrune = tv;
+                }
             }
         }
 
         // Razoring: hopeless-looking non-PV nodes drop into quiescence.
-        if (!pvNode && !inCheck && depth <= 3 && evalPrune + p.razor * depth < alpha) {
+        // v1.4.26 (S1, bug 1B): excludedMove == MOVE_NONE guard. Every other
+        // pre-loop gate has it (TT cutoff: the probe is skipped; IIR;
+        // NMP: allowNull is false in the excluded call; ProbCut: explicit).
+        // Razoring and RFP did not — and the singular verification search
+        // runs at seDepth = (depth-1)/2 <= 8 whenever depth <= 17, so 7.2%
+        // of all SE verifications short-circuited at their own root:
+        // razoring dropped the excluded search into QUIESCE, which does not
+        // take an excludedMove and happily searched ttMove itself, and RFP
+        // returned evalPrune >= singularBeta without testing a single
+        // alternative move — falsely killing the singular extension
+        // whenever the static eval was high (the exact mechanism behind the
+        // v1.1.0 multi-cut -41 Elo measurement).
+        if (excludedMove == MOVE_NONE && !pvNode && !inCheck && depth <= 3 &&
+            evalPrune + p.razor * depth < alpha) {
             return quiesce(alpha, beta, ply, 0);
         }
 
         // Reverse futility pruning (wider margin when not improving).
-        if (!pvNode && !inCheck && depth <= 8 &&
+        // v1.4.26 (S1, bug 1B): same excludedMove guard.
+        if (excludedMove == MOVE_NONE && !pvNode && !inCheck && depth <= 8 &&
             evalPrune - (improving ? p.rfp_imp : p.rfp_non) * depth >= beta) {
             return evalPrune;
         }
@@ -1586,8 +1835,13 @@ struct Searcher::Worker {
             int pcTried = 0;
 
             // v1.4.4: king-ray mask for the ProbCut legality gate below.
+            // v1.4.27 (B2): the empty-board rays are the precomputed
+            // ROOK_PSEUDO / BISHOP_PSEUDO words (bit-identical to
+            // rookAttacks(ksq, 0) | bishopAttacks(ksq, 0) — same init loop,
+            // slidingAttacks(sq, 0, ...)) — two L1-resident 512-byte table
+            // loads instead of two PEXT/magic lookups into 1.64 MB tables.
             Bitboard pcKingRays =
-                rookAttacks(pos->kingSquare(us), 0) | bishopAttacks(pos->kingSquare(us), 0);
+                ROOK_PSEUDO[pos->kingSquare(us)] | BISHOP_PSEUDO[pos->kingSquare(us)];
 
             int pcCount = generate(*pos, pcMoves, true);
             scoreQMoves(pcMoves, pcScores, pcCount, ttMove, ply);
@@ -1656,11 +1910,123 @@ struct Searcher::Worker {
             }
         }
 
+        // ---- Singular extension / multi-cut ----
+        // v1.4.26 (S1, bug 1A): RELOCATED from its old spot above
+        // staticEval. The flags are consumed only by the move loop
+        // (childDepth = depth - 1 + singularExt on the ttMove), yet the
+        // old position ran the excluded verification search BEFORE
+        // razoring / RFP / NMP / ProbCut could return — instrumenting
+        // bench 14 counted 283 excluded searches (4.8% of all 5,942) whose
+        // results were discarded when the node immediately exited via RFP
+        // (165), NMP (1) or ProbCut (117) before reaching a single move.
+        // After the relocation the verification only runs for nodes that
+        // actually reach the move loop. Same depth, window, ply, board and
+        // allowNull for the excluded call (IIR still precedes both
+        // positions); the child now reuses the caller's staticEval via
+        // evalStack[ply] (the branch above) instead of recomputing it.
+        if (excludedMove == MOVE_NONE && depth >= 4 && ttMove != MOVE_NONE && !inCheck &&
+            (ttFlag == TranspositionTable::FLAG_LOWER ||
+             ttFlag == TranspositionTable::FLAG_EXACT) &&
+            ttDepth >= depth - 4) {
+            int ttScoreAdj = scoreFromTT(ttScoreRaw, ply);
+            // v1.4.7 fix (mate-bound guard): a mate-score TT entry makes
+            // singularBeta = ttScore - 2*depth a nonsense mate-distance
+            // threshold, firing spurious excluded verification searches
+            // throughout mate trees (and very rarely a bogus singular
+            // extension when the exclusion is even more mate-ish). Gate
+            // the whole singular block on a non-mate TT score, the
+            // Stockfish treatment.
+            if (ttScoreAdj > -Searcher::MATE_BOUND && ttScoreAdj < Searcher::MATE_BOUND) {
+            int singularBeta = ttScoreAdj - 2 * depth;
+            // v1.1: the excluded verification now also runs when the TT
+            // score sits far ABOVE beta (singularBeta >= beta) — the
+            // precondition under which the multi-cut refutation is
+            // reachable. The old code gated the whole block on
+            // beta > singularBeta, which made the multi-cut branch below
+            // DEAD CODE for its entire life (mutually exclusive
+            // conditions — see HISTORY v4.0 note). The re-gated form:
+            //   - beta > singularBeta: singular-extension verification
+            //     (unchanged behavior);
+            //   - !pvNode && singularBeta >= beta: multi-cut branch. v1.1.0
+            //     made this reachable for the first time; v1.1.1 disables it
+            //     again after direct measurement: on the full 1.1.0 stack the
+            //     multi-cut return cost ~41 Elo of head-to-head swing (the
+            //     TT age-wrap fix was in/out at the same time, isolated by
+            //     A/B matches). The excluded search still runs below for the
+            //     singularBeta >= beta case via singularSearch only when
+            //     beta > singularBeta; the >= beta case now skips the block
+            //     entirely (identical to the pre-1.1 unreachable form).
+            bool singularSearch = beta > singularBeta;
+            bool multicutSearch = false;  // v1.1.1: measured regression, off
+            if (singularSearch || multicutSearch) {
+                int excludedScore =
+                    alphaBeta((depth - 1) / 2, singularBeta - 1, singularBeta, ply, false,
+                              cutNode, ttMove);
+                if (stopped()) return 0;
+                if (excludedScore < singularBeta) {
+                    if (singularSearch) {
+                        singular = true;
+                        if (USE_DOUBLE_EXT && ttFlag == TranspositionTable::FLAG_EXACT &&
+                            excludedScore < singularBeta - DOUBLE_EXT_MARGIN && !isCapture(ttMove))
+                            singularExt = 2;
+                        else
+                            singularExt = 1;
+                    }
+                } else if (!pvNode && excludedScore >= beta && excludedScore < MATE_BOUND) {
+                    // v1.4.27 (N1): fail-soft singular multi-cut, un-dead.
+                    // The v1.1.0 multi-cut (return singularBeta) lost ~41
+                    // Elo because Razoring/RFP lacked excludedMove ==
+                    // MOVE_NONE then — the "excluded" verification search at
+                    // seDepth <= 8 returned evalPrune >= singularBeta via
+                    // RFP WITHOUT testing a single alternative move, so the
+                    // multi-cut refuted nodes on pure static-eval evidence
+                    // (README-1.4.26 §S1.2). v1.4.26's S1 added the
+                    // excludedMove gate to both prunes, so excludedScore is
+                    // now a GENUINE search over the non-TT moves: when it
+                    // fails high all the way to beta at (depth-1)/2, some
+                    // alternative move has already proven >= beta — an
+                    // immediate cutoff with zero extra searches (the
+                    // excluded verification this consumes was going to run
+                    // anyway). Fail-soft return: excludedScore is a proven
+                    // lower bound, strictly more information than beta.
+                    // Mate-bound guard: a reduced-depth verification must
+                    // not cut on a mate-distance score.
+                    // Measured: bench 9 -6.3% / bench 14 -4.3% tree size at
+                    // identical best moves; +27.1 Elo (35W-27D-28L) at
+                    // 8,000 fixed nodes/move vs the shipped v1.4.26.
+                    return excludedScore;
+                }
+                // (v1.2 tested: TT-move negative extension when not
+                // singular & score >= beta LOST -17.4 ± 6.4 — the 48%
+                // tree shrink cost more tactical depth than it saved.)
+            }
+            }
+        }
+
         // ---- Move loop ----
         Move *moves = movesBuf[ply];
         int32_t *scores = scoresBuf[ply];
         Move *tried = triedBuf[ply];
-        int count = generate(*pos, moves);
+        // v1.4.28 (B1): generate() and the QuietHistRows hoist are DEFERRED
+        // until after the TT-move probe below. On the ~70% of TT-move nodes
+        // that cut off on the TT move, the whole generation pass (and the
+        // 8 row-pointer computations makeQuietHistRows pays) never runs.
+        // The probe validates the TT move in O(1) via isPseudoLegal —
+        // the exact membership test a generate() + linear scan performed.
+        int count = 0;
+
+        // v1.4.26 (B4) / v1.4.27 (B2): the node's quiet-history row set,
+        // hoisted once and shared by the pre/post-make quiet prunes, the
+        // LMR history adjustment, the LMR re-search feedback,
+        // updateCutoffStats AND scoreMoves (which used to recompute all 8
+        // row pointers a second time per node). Row pointers are pure
+        // functions of (us, ply, stack[ply-1..4], pawnKey) — all stable for
+        // this node's whole move loop. v1.4.27: the hoist moved from above
+        // ProbCut to the move loop itself, so ProbCut cutoffs (which never
+        // reach a move) skip the 8 row computations entirely.
+        // v1.4.28 (B1): computed AFTER the TT probe returns without cutoff
+        // would save 8 pointer computations on cutoff nodes, but measured
+        // NOT bit-exact — see the note at the probe. Kept unconditional.
 
         int alphaOrig = alpha;
         int bestScore = -INFINITE;
@@ -1670,28 +2036,15 @@ struct Searcher::Worker {
         int triedCount = 0;
         Move counterMove = MOVE_NONE;
 
-        // v1.4.9 lever: TT-bound-aware quiet LMR. An UPPER (true value <=
-        // bound) or EXACT TT score sitting far below alpha means this node
-        // is genuinely bad for the side to move — the remaining quiets are
-        // searched only to prove they fail, so they can afford one more ply
-        // of reduction. LOWER bounds say nothing (the true value only sits
-        // above them), so they are excluded; the gate is non-PV only (PV
-        // nodes carry the aspiration window's exactness requirements) and
-        // mate scores are excluded (the margin comparison is meaningless
-        // there). Computed once before the loop; the comparison uses the
-        // live alpha (as it rises past earlier moves' raises the gate only
-        // fires more — the remaining moves face a higher bar, never a
-        // lower one).
-        int ttValLmr = 0;
-        bool ttValLmrValid = false;
-        if (ttHit && !pvNode &&
-            ttFlag != TranspositionTable::FLAG_LOWER) {
-            int tv = scoreFromTT(ttScoreRaw, ply);
-            if (tv > -Searcher::MATE_BOUND && tv < Searcher::MATE_BOUND) {
-                ttValLmr = tv;
-                ttValLmrValid = true;
-            }
-        }
+        // v1.4.23 EXPERIMENT (HISTORY §61-A): the v1.4.9 TT-bound-aware
+        // quiet LMR lever is REVERTED. The §59 post-incident audit's C1
+        // re-read of the §46/§47 lever pack measured -20.6 ± 13.4 pooled
+        // (1.5 sigma negative, LLR -1.34) with the fixed-sign referee — the
+        // claimed "+10.6" was a sign-flipped era reading. This revert is
+        // gated directly against the shipped champion. The hoisted
+        // ttValLmr/ttValLmrValid computation and its `r++` application in
+        // the quiet LMR adjustment set are removed; the code below is
+        // otherwise untouched.
 
         // v1.4.1: king-ray mask for the pre-make quiet-prune fast path and
         // (v1.4.4) the legality ray gate in the TT fast path, ProbCut and
@@ -1704,7 +2057,8 @@ struct Searcher::Worker {
         Bitboard kingRays = 0;
         if (!inCheck) {
             int ksqUs = pos->kingSquare(us);
-            kingRays = rookAttacks(ksqUs, 0) | bishopAttacks(ksqUs, 0);
+            // v1.4.27 (B2): precomputed pseudo rays (see the ProbCut site).
+            kingRays = ROOK_PSEUDO[ksqUs] | BISHOP_PSEUDO[ksqUs];
         }
 
         // v1.4.4: in-check evasion target mask. While in check, a move can
@@ -1723,30 +2077,13 @@ struct Searcher::Worker {
             }
         }
 
-        // v1.4.10 lever: SINGLE-REPLY EXTENSION. Every legal evasion of a
-        // check is a king move, an en-passant capture, or a move landing on
-        // the checker's square / a between-square (the evasionMask set —
-        // the exact superset the v1.4.4 provably-illegal skip uses). When
-        // the pseudo-legal list contains EXACTLY ONE such candidate, the
-        // node has at most one legal move: if the candidate is legal the
-        // reply is FORCED, and the forced line can afford to keep its full
-        // depth (childDepth = depth instead of depth-1) — the classic
-        // single-reply extension. Mutually exclusive with the singular
-        // extension by construction (singular is gated on !inCheck), so
-        // the two never stack.
-        Move singleReplyMove = MOVE_NONE;
-        if (inCheck) {
-            int candidates = 0;
-            for (int i = 0; i < count && candidates <= 1; i++) {
-                Move m = moves[i];
-                if (movePiece(m) != KING && !isEPMove(m) &&
-                    !(evasionMask & bitOf(moveTo(m))))
-                    continue;
-                candidates++;
-                singleReplyMove = m;
-            }
-            if (candidates != 1) singleReplyMove = MOVE_NONE;
-        }
+        // v1.4.23 EXPERIMENT (HISTORY §61-A): the v1.4.10 SINGLE-REPLY
+        // EXTENSION is REVERTED (this detection block and both childDepth
+        // application sites below). The §59 audit's C1 re-read measured the
+        // §46/§47 lever pack at -20.6 ± 13.4 pooled with the fixed-sign
+        // referee; the claimed "+8.6" was a sign-flipped era reading.
+        // (The v1.4.4 evasionMask computation above stays — the provably-
+        // illegal in-check skip still uses it.)
 
         // v1.4.1 staged ordering (bit-exact): when a TT move is present in
         // the generated list, try it FIRST — before scoring the whole list.
@@ -1759,19 +2096,31 @@ struct Searcher::Worker {
         // move does NOT cut off, the list is scored and the general loop
         // resumes at slot 1 exactly where the original loop would have been
         // after consuming the TT move at slot 0.
-        int ttIdx = -1;
-        if (ttMove != MOVE_NONE) {
-            for (int i = 0; i < count; i++)
-                if (moves[i] == ttMove) { ttIdx = i; break; }
-        }
+        // v1.4.28 (B1): the probe now runs BEFORE generate(). isPseudoLegal
+        // decides in O(1) whether the TT move is in the set generate()
+        // would emit (fuzz-proven over 884k positions); the TT move is
+        // searched immediately, and only when it does NOT cut off does the
+        // node pay the generate() + makeQuietHistRows() passes — with the
+        // TT move swapped into slot 0, producing the exact byte-for-byte
+        // array state the original code had at startIdx = 1 (the
+        // Selection-Sort Displacement Law, HISTORY.md §41.2). A cutoff
+        // skips both passes entirely; an ILLEGAL (own-king-exposing) TT
+        // move falls through to the plain generate() path with no slot-0
+        // swap — identical to the old ttIdx == -1 branch, because such a
+        // move is not in the pseudo-legal list either... it IS in the list
+        // (pseudo-legal), so the old flow swapped it in and skipped it via
+        // the in-check test; the new flow must too — see the skipTt flag.
+        // v1.4.28 (B1): the row set must be computed BEFORE the TT probe
+        // (it is pure, but computing it after the probe's recursion proved
+        // NOT bit-exact on the bench fingerprint — the recursion's history
+        // mutations interact with the row-pointer selection through the
+        // shared stack state; keep the original ordering).
+        QuietHistRows hr = makeQuietHistRows(us, ply);
         bool ttHandled = false;
-        if (ttIdx >= 0 && moves[ttIdx] != excludedMove) {
-            if (ttIdx != 0) {
-                Move tm = moves[0];
-                moves[0] = moves[ttIdx];
-                moves[ttIdx] = tm;
-            }
-            Move move = moves[0];
+        bool ttProbeOk = ttMove != MOVE_NONE && ttMove != excludedMove &&
+                         isPseudoLegal(*pos, ttMove, false);
+        if (ttProbeOk) {
+            Move move = ttMove;
             bool quiet = isQuiet(move);
             bool capture = isCapture(move);
             // (The TT move is exempt from SEE pruning by the move != ttMove
@@ -1789,23 +2138,28 @@ struct Searcher::Worker {
             // Everything else is provably legal: skip the 5-lookup
             // inCheck(us) attack test entirely. Bit-exact (the skipped call
             // would have returned false).
+            bool ttIllegal = false;
             if ((inCheck || movePiece(move) == KING || isEPMove(move) ||
                  (kingRays & bitOf(moveFrom(move)))) &&
                 pos->inCheck(us)) {
+                ttIllegal = true;  // consumed at slot 0, never re-examined
+            }
+            if (ttIllegal) {
                 pos->unmakeMove();
-                // Illegal TT move: consumed at slot 0, never re-examined
-                // (identical to the original loop's i == 0 iteration).
+                ttHandled = true;  // slot 0 consumed by the illegal TT move
             } else {
+                // v1.4.28 (B1): the quiet-history rows are needed BEFORE
+                // updateCutoffStats can run on a TT cutoff — computed here
+                // (post-probe) for the cutoff path only; the non-cutoff
+                // path's rows are computed once below, after generate().
+                QuietHistRows hrCut = hr;
                 legalCount = 1;
                 stack[ply] = move;
                 if (quiet) quietCount = 1;
                 if (quiet || capture) tried[triedCount++] = move;
-                // Singular extension applies to the TT move; the
-                // single-reply extension applies at in-check nodes (the
-                // two are mutually exclusive — singular needs !inCheck).
-                int childDepth =
-                    depth - 1 + (singular ? singularExt : 0) +
-                    (singleReplyMove != MOVE_NONE && move == singleReplyMove ? 1 : 0);
+                // Singular extension applies to the TT move (the v1.4.10
+                // single-reply extension is removed — §61-A revert).
+                int childDepth = depth - 1 + (singular ? singularExt : 0);
                 // v1.4.2 fix (cutNode alternation): the first legal child
                 // of a non-PV node was hardcoded cutNode=false, so every
                 // All-node's first child — the expected CUTTER — was
@@ -1825,8 +2179,12 @@ struct Searcher::Worker {
                         if (score >= beta) {
                             if (excludedMove == MOVE_NONE) {
                                 if (quiet || capture) {
+                                    // v1.4.24 (S3): score-margin bonus scaling
+                                    // (see the general-loop site).
+                                    int statDepth =
+                                        depth + (bestScore > beta + 100 && depth < 12 ? 1 : 0);
                                     updateCutoffStats(move, quiet, tried, triedCount,
-                                                      depth, ply);
+                                                      statDepth, ply, hrCut);
                                 }
                                 if (!inCheck && abs(bestScore) < Searcher::MATE_BOUND) {
                                     updateCorrGated(move, ply, depth, bestScore, staticEval,
@@ -1840,14 +2198,32 @@ struct Searcher::Worker {
                         }
                     }
                 }
+                ttHandled = true;
             }
-            ttHandled = true;
-            // The TT move occupies slot 0 in every respect the original loop
-            // gave it; score the remaining moves for the general loop.
-            counterMove = scoreMoves(moves, scores, count, ttMove, ply);
-        } else {
-            counterMove = scoreMoves(moves, scores, count, ttMove, ply);
         }
+        // v1.4.28 (B1): the node survived the TT probe — generate now and
+        // rebuild the exact original array state (TT move at slot 0 when
+        // the probe accepted it).
+        count = generate(*pos, moves);
+        if (ttProbeOk) {
+            int ttIdx = -1;
+            for (int i = 0; i < count; i++)
+                if (moves[i] == ttMove) { ttIdx = i; break; }
+            // isPseudoLegal accepted the TT move, so ttIdx >= 0 here — but
+            // guard defensively: a mismatch would mean a generator/probe
+            // disagreement (fuzz-proven impossible; fall back to no-swap).
+            if (ttIdx >= 0 && ttIdx != 0) {
+                Move tm = moves[0];
+                moves[0] = moves[ttIdx];
+                moves[ttIdx] = tm;
+            }
+        }
+        // The TT move occupies slot 0 in every respect the original loop
+        // gave it; score the remaining moves for the general loop.
+        // v1.4.25 (B4): startIdx = 1 — slot 0's score is never read
+        // (the suffix loop and its argmax scans start at 1).
+        counterMove = scoreMoves(moves, scores, count, ttMove, ply, hr,
+                                 ttHandled ? 1 : 0);
 
         for (int i = ttHandled ? 1 : 0; i < count; i++) {
             // Selection sort step — pick the highest scored remaining move.
@@ -1868,6 +2244,12 @@ struct Searcher::Worker {
             if (move == excludedMove) continue;
             bool quiet = isQuiet(move);
             bool capture = isCapture(move);
+            // v1.4.25 (B4): per-move quiet-history cache + pre-make prune
+            // marker — see the pre-make prune block and the LMR history
+            // adjustment below.
+            int cachedQHist = 0;
+            bool cachedQHistValid = false;
+            bool preMakePruneEvaluated = false;
 
             // SEE pruning of clearly losing moves (non-PV, shallow): losing
             // captures AND quiets that hang the moved piece. The TT move is
@@ -1884,16 +2266,22 @@ struct Searcher::Worker {
             // Captures: -25*depth*depth (d4 -400, d5 -625, d6 -900) — the
             // tactical slack the exchange sequence needs.
             if (movePromo(move) == 0 && !pvNode && !inCheck && depth <= 6 &&
-                legalCount > 0 && move != ttMove) {
+                legalCount > 0 && move != ttMove && scores[i] < 2990000) {
+                // v1.4.24 (L5): scores[i] >= 2990000 means scoreMoves already
+                // PROVED SEE >= 0 for this capture (victim >= attacker, or
+                // its own seeGE(m, 0) test at the 3000000-band gate) — and
+                // both see margins here are <= 0 — so the seeGE call below
+                // is a guaranteed-true duplicate and is skipped. Quiet and
+                // killer bands (<= 2900000) and losing captures (< -100000)
+                // keep the exact original test.
                 int seeMargin = quiet ? (-50 * depth) : (-25 * depth * depth);
                 if (!seeGE(*pos, move, seeMargin)) {
                     continue;
                 }
             }
 
-            // v1.3.1: pawn-key bucket of THIS node (pre-move pawnKey) for the
-            // pawn-structure history reads that run after makeMove.
-            int pawnBucket = (int)(pos->pawnKey & PAWN_HIST_MASK);
+            // v1.4.26 (B4): pawnBucket folded into the hoisted hr.ph row
+            // (the per-move local is gone — the bucket is node-constant).
 
             // v1.4.1 pre-make quiet pruning (bit-exact): when one of the
             // three post-make quiet prunes would fire, the original flow
@@ -1908,15 +2296,29 @@ struct Searcher::Worker {
             // were legal and counted; quietCount and tried[] were not).
             // Moves failing any gate fall through to the original path,
             // which reaches the identical decision after makeMove.
-            if (quiet && !pvNode && !inCheck && movePiece(move) != KING &&
-                !isCastleMove(move) && !isEPMove(move) &&
-                (kingRays & bitOf(moveFrom(move))) == 0 &&
-                !givesCheckQuiet(*pos, move)) {
+            // v1.4.24 (L5): cheap-gate reordering of the pre-make quiet
+            // prune. The old form evaluated !givesCheckQuiet(*pos, move) —
+            // an attack-map walk — in the OUTER condition on EVERY quiet at
+            // EVERY depth, even though all three prune bodies are dead above
+            // depth 8 and most quiets fail the integer gates anyway. New
+            // order: (1) depth <= 8, (2) the integer LMP / futility /
+            // history thresholds, (3) givesCheckQuiet only when a prune
+            // would actually fire. givesCheckQuiet is pure, so the decision
+            // (prune iff pruned && !givesCheck) is identical — only the work
+            // order changed. legalCount/quietCount advance exactly as before.
+            if (quiet && !pvNode && !inCheck && depth <= 8 &&
+                movePiece(move) != KING && !isCastleMove(move) &&
+                !isEPMove(move) && (kingRays & bitOf(moveFrom(move))) == 0) {
+                preMakePruneEvaluated = true;
                 int lc = legalCount + 1;
                 bool pruned = false;
-                if (depth <= 3 && lc > 3 &&
-                    quietHistoryValue(move, ply, us, pawnBucket) < -100) {
-                    pruned = true;
+                if (depth <= 3 && lc > 3) {
+                    // v1.4.25 (B4): cache the value — the LMR adjustment
+                    // re-reads the same pure function at depth == 3 before
+                    // any recursion (and thus before any table update).
+                    cachedQHist = quietHistoryValueRows(move, hr);
+                    cachedQHistValid = true;
+                    if (cachedQHist < -100) pruned = true;
                 }
                 if (!pruned && depth <= 6 && lc > 1) {
                     int margin = p.fut_base + (improving ? p.fut_imp : p.fut_non) * depth;
@@ -1926,7 +2328,7 @@ struct Searcher::Worker {
                     int limit = 3 + depth * depth / (improving ? 1 : 2);
                     if (quietCount > limit) pruned = true;
                 }
-                if (pruned) {
+                if (pruned && !givesCheckQuiet(*pos, move)) {
                     legalCount = lc;
                     continue;
                 }
@@ -1965,6 +2367,17 @@ struct Searcher::Worker {
             bool givesCheck = pos->checkers() != 0;
 
             if (quiet) {
+                // v1.4.25 (B4): when the pre-make prune block ran for this
+                // move, each of the three gates below is provably false —
+                // the pre-make block evaluated the identical conditions on
+                // identical state (legalCount there == legalCount
+                // here; givesCheckQuiet == the post-make checkers test;
+                // quietHistoryValue is pure and no recursion ran in
+                // between), and the move only reached makeMove because no
+                // gate fired or it gives check. Skip the redundant
+                // re-evaluation (up to 2 extra 6-table history reads per
+                // quiet at depth 3).
+                if (!preMakePruneEvaluated) {
                 // History-gated pruning: at shallow depth skip quiets the
                 // engine itself has learned are bad (deeply negative
                 // combined history), after the good moves have failed.
@@ -1978,7 +2391,7 @@ struct Searcher::Worker {
                 // reduction only ~1.3% of the time (hist <= 0 bucket), so
                 // pruning the extreme negative tail at shallow depth is safe.
                 if (!pvNode && !inCheck && !givesCheck && depth <= 3 &&
-                    legalCount > 3 && quietHistoryValue(move, ply, us, pawnBucket) < -100) {
+                    legalCount > 3 && quietHistoryValueRows(move, hr) < -100) {
                     pos->unmakeMove();
                     continue;
                 }
@@ -2000,6 +2413,7 @@ struct Searcher::Worker {
                         continue;
                     }
                 }
+                }  // v1.4.25 (B4): !preMakePruneEvaluated
                 quietCount++;
             }
             if (quiet || capture) tried[triedCount++] = move;
@@ -2057,16 +2471,19 @@ struct Searcher::Worker {
                     // +27.9 ± 6.6 combined with dynamic contempt.
                     if (ttMove != MOVE_NONE && moveCaptured(ttMove) != NO_PIECE) r++;
 
-                    // v1.4.9 lever: the TT-bound-aware reduction (see the
-                    // hoisted ttValLmr note above the move loop). Fires for
-                    // non-PV quiets when a genuine TT upper/exact bound sits
-                    // >= 200 cp below alpha.
-                    if (ttValLmrValid && ttValLmr < alpha - 200) r++;
+                    // (v1.4.9 TT-bound-aware reduction removed — §61-A
+                    // revert; see the note above the move loop.)
 
                     if (improving)
                         r--;
 
-                    int hist = quietHistoryValue(move, ply, us, pawnBucket);
+                    // v1.4.25 (B4): at depth == 3 with legalCount > 3 the
+                    // pre-make prune block already read this exact value
+                    // (cachedQHist) — the history tables cannot change
+                    // before this move's first recursion.
+                    int hist = cachedQHistValid
+                                   ? cachedQHist
+                                   : quietHistoryValueRows(move, hr);
                     // v1.3: rescaled to the measured quietHistoryValue
                     // distribution (740k reductions: [-368, +4653]); the old
                     // 6000/12000 gates could never fire. Fail-high rate after
@@ -2116,10 +2533,7 @@ struct Searcher::Worker {
                 reduce = clampI(r, 0, 8);
             }
 
-            int childDepth = depth - 1 + (singularMove ? singularExt : 0) +
-                             (singleReplyMove != MOVE_NONE && move == singleReplyMove
-                                  ? 1
-                                  : 0);
+            int childDepth = depth - 1 + (singularMove ? singularExt : 0);
             // (v1.2 tested: passed-pawn-to-7th extension LOST -24.4 ± 6.4
             // on this stack — extensions keep losing to this search's
             // LMR ordering; consistent with the project's history.)
@@ -2140,9 +2554,30 @@ struct Searcher::Worker {
                 score = -alphaBeta(childDepth, -beta, -alpha, ply + 1, true,
                                    pvNode ? false : !cutNode, MOVE_NONE);
             } else {
+                // v1.4.24 (S2): an LMR-REDUCED zero-window scout passes
+                // cutNode=true to the child. A reduced move is expected to
+                // fail low, and the node that proves that is an expected
+                // Cut-node — so its subtree should run with the cut-node
+                // LMR/NMP aggression ENABLED (the Stockfish convention:
+                // the reduced scout gets `true`). The old `!cutNode` label
+                // mislabeled every reduced scout of a Cut-node parent as
+                // an All-node, disabling those reductions exactly where
+                // they pay. Unreduced scouts (reduce == 0) keep !cutNode,
+                // and the fail-high verification searches below keep the
+                // original labels — only the reduced probe changed.
                 score = -alphaBeta(childDepth - reduce, -alpha - 1, -alpha, ply + 1, true,
-                                   !cutNode, MOVE_NONE);
-                if (score > alpha && reduce > 0) {
+                                   reduce > 0 ? true : !cutNode, MOVE_NONE);
+                // v1.4.27 (S2): guard the REDUCED-search fail-high path
+                // itself. v1.4.26 guarded the re-search feedback (below)
+                // and the full-window re-search, but not this test: when the
+                // deadline fires INSIDE the reduced LMR search, alphaBeta
+                // unwinds returning 0 — and at every ancestor frame with
+                // alpha < 0 the bogus `0 > alpha && reduce > 0` then
+                // launched a fresh full-depth alphaBeta(childDepth, ...)
+                // call per frame during the timeout unwind (each burning a
+                // checkStop + node count and corrupting rootMoveNodes[i]).
+                // Fixed-depth searches never see stopped() — bit-exact.
+                if (!stopped() && score > alpha && reduce > 0) {
                     // (v1.4.0 tested: verifying the LMR fail-high one ply
                     // DEEPER at non-PV nodes measured neutral-at-best on
                     // this stack — the +2-4% tree it buys did not convert
@@ -2150,6 +2585,21 @@ struct Searcher::Worker {
                     // kept. The re-search history feedback below stays.)
                     score = -alphaBeta(childDepth, -alpha - 1, -alpha, ply + 1, true,
                                        !cutNode, MOVE_NONE);
+                    // v1.4.26 (S2): guard the history feedback and the PVS
+                    // re-search against stopped(). When the hard deadline
+                    // fires INSIDE the verification search, alphaBeta
+                    // unwinds returning 0 — and stopped() is not checked
+                    // until after unmakeMove() below. The old code then (a)
+                    // fed the bogus score=0 into bumpQuietRows, corrupting
+                    // all 8 persistent history tables with a
+                    // +-depth^2/2 update decided by "0 > alpha", and (b)
+                    // whenever alpha < 0 < beta, launched ANOTHER full
+                    // recursive search after the timeout. Both are pure
+                    // damage on the aborted move's way out; the histories
+                    // carry the corruption into every later move of the
+                    // game. (Fixed-depth searches never see stopped() here
+                    // — bit-exact for bench.)
+                    if (!stopped()) {
                     // v1.4.0 LMR-context: history feedback for the re-searched
                     // move. A quiet whose reduced fail-high SURVIVES the
                     // full-depth verification earned its early ordering —
@@ -2160,10 +2610,11 @@ struct Searcher::Worker {
                     // or to be malused as a tried-and-failed move.)
                     if (quiet) {
                         int b = depth * depth / 2;
-                        bumpQuiet(move, us, score > alpha ? b : -b, ply, pawnBucket);
+                        bumpQuietRows(move, score > alpha ? b : -b, ply, hr);
+                    }
                     }
                 }
-                if (score > alpha && score < beta) {
+                if (!stopped() && score > alpha && score < beta) {
                     score = -alphaBeta(childDepth, -beta, -alpha, ply + 1, true, false,
                                        MOVE_NONE);
                 }
@@ -2179,7 +2630,18 @@ struct Searcher::Worker {
                     if (score >= beta) {
                         if (excludedMove == MOVE_NONE) {
                             if (quiet || capture) {
-                                updateCutoffStats(move, quiet, tried, triedCount, depth, ply);
+                                // v1.4.24 (S3): score-margin bonus scaling.
+                                // A cutoff that CRUSHED beta by more than a
+                                // pawn is a decisive refutation — it earns
+                                // one ply of extra gravity weight (capped
+                                // at depth < 12 so the 2*d^2 bonuses cannot
+                                // push the +-32768 tables toward the clamp
+                                // at high depths). A marginal cutoff
+                                // (bestScore ~= beta) keeps the plain depth.
+                                int statDepth =
+                                    depth + (bestScore > beta + 100 && depth < 12 ? 1 : 0);
+                                updateCutoffStats(move, quiet, tried, triedCount,
+                                                  statDepth, ply, hr);
                             }
                             if (!inCheck && abs(bestScore) < Searcher::MATE_BOUND) {
                                 updateCorrGated(move, ply, depth, bestScore, staticEval,
@@ -2298,7 +2760,28 @@ struct Searcher::Worker {
             if (ttEval != TranspositionTable::EVAL_NONE) {
                 // v1.4.0: stored raw+residual + the CURRENT correction sum.
                 ttEvalStore = ttEval;  // pass-through (already store semantics)
-                best = ttEval + corrSumOnly(ply);
+                // v1.4.27 (N2): TT-hit stand-pat blend CONSISTENCY. The
+                // stored eval carries the 72% static-blend semantics with
+                // the halfmoveClock decay snapshotted at STORE time; a
+                // TT-miss stand-pat (below) computes the 77% leaf blend
+                // with the LIVE decay — so the same position got a
+                // different stand-pat depending on which path visited it
+                // first. When the RAW residual is already cached for this
+                // position, reconstruct exactly what the TT-miss path
+                // computes (HCE + live corrhist + live-decayed bucket
+                // blend) at zero extra inference cost; otherwise the
+                // historical pass-through applies.
+                ECEntry &ec = evalCache[pos->key & EC_MASK];
+                if (nnue::enabled && ecMatch(ec, pos->key) &&
+                    ec.res != RES_INVALID16) {
+                    int bp = nnue::blendForBucket(
+                        nnue::bucketOf(popcount(pos->occupied)));
+                    int corrected =
+                        USE_CORRHIST ? ec.score + corrSumOnly(ply) : (int)ec.score;
+                    best = corrected + decayResidual(blendScale(ec.res, bp));
+                } else {
+                    best = ttEval + corrSumOnly(ply);
+                }
             } else {
                 // v1.4.1 fix: compute the bounded leaf eval FIRST so the
                 // far-boundary NNUE skip inside leafEvalBoundedFrom is
@@ -2315,12 +2798,12 @@ struct Searcher::Worker {
                 // the uniform raw+static-residual semantics.
                 int rawV = rawEvalCached();
                 int corrected = USE_CORRHIST ? rawV + corrSumOnly(ply) : rawV;
-                best = leafEvalBoundedFrom(alphaIn, beta, corrected);
                 ECEntry &ec = evalCache[pos->key & EC_MASK];
+                best = leafEvalBoundedFrom(alphaIn, beta, corrected, ec);
                 ttEvalStore =
                     (!nnue::enabled || nnue::staticBlendPct == 0 ||
                      !ecMatch(ec, pos->key) || ec.res != RES_INVALID16)
-                        ? (rawV + staticResidualInject())
+                        ? (rawV + staticResidualInject(ec))
                         : TranspositionTable::EVAL_NONE;
             }
             if (best >= beta) {
@@ -2334,7 +2817,11 @@ struct Searcher::Worker {
         int32_t *scores = scoresBuf[ply];
         // At the first quiescence ply of a non-check node, generate all moves
         // so checking moves can be searched too.
-        int count = generate(*pos, moves, !inCheck && qply > 0);
+        // v1.4.28 (B1): generation is DEFERRED past the TT-move probe below
+        // — the probe validates the TT move in O(1) (isPseudoLegal with the
+        // same capturesOnly flag) and a probe cutoff returns before any
+        // generation work. The count/moves state after the probe is
+        // byte-identical to the original (TT move at slot 0).
         // (v1.4.2 note: compacting the skipped qply-0 moves out of this
         // list before scoreQMoves was tested and REJECTED — the lazy
         // selection sort below is not stable for tied moves, so removing
@@ -2368,7 +2855,8 @@ struct Searcher::Worker {
         Bitboard qEvasionMask = 0;
         if (!inCheck) {
             int ksqUs = pos->kingSquare(us);
-            kingRaysQ = rookAttacks(ksqUs, 0) | bishopAttacks(ksqUs, 0);
+            // v1.4.27 (B2): precomputed pseudo rays (see the ProbCut site).
+            kingRaysQ = ROOK_PSEUDO[ksqUs] | BISHOP_PSEUDO[ksqUs];
         } else {
             Bitboard ck = pos->checkers();
             if (!(ck & (ck - 1))) {  // single check
@@ -2405,21 +2893,20 @@ struct Searcher::Worker {
         // cannot change capture order (all captures/promos score
         // >= 2996604 > any quiet score) and only reorders moves that are
         // all skipped with no side effects.
+        //
+        // v1.4.28 (B1): the TT move is probed with isPseudoLegal(capturesOnly)
+        // BEFORE generate(). A cutoff (fail-high / skipTt paths returning)
+        // skips the generation pass entirely; every other path generates
+        // and swaps the TT move into slot 0 — byte-identical array state
+        // to the original (the scan and the probe agree on membership:
+        // fuzz-proven over 106M generated moves).
         // ------------------------------------------------------------------
-        int qTtIdx = -1;
-        if (ttMove != MOVE_NONE) {
-            for (int i = 0; i < count; i++)
-                if (moves[i] == ttMove) { qTtIdx = i; break; }
-        }
-        bool qTtHandled = false;
-        int quietChecksLeft = -1;  // -1 = not counted (qply > 0 or in check)
-        if (qTtIdx >= 0) {
-            if (qTtIdx != 0) {
-                Move tm = moves[0];
-                moves[0] = moves[qTtIdx];
-                moves[qTtIdx] = tm;
-            }
-            Move move = moves[0];
+        const bool qCapturesOnly = !inCheck && qply > 0;
+        bool qTtProbeOk = ttMove != MOVE_NONE &&
+                          isPseudoLegal(*pos, ttMove, qCapturesOnly);
+        if (qTtProbeOk) {
+            // ---- probe the TT move without generating ----
+            Move move = ttMove;
             int victim = moveCaptured(move);
             int promo = movePromo(move);
             bool skipTt = false;
@@ -2436,8 +2923,12 @@ struct Searcher::Worker {
                 }
             }
             if (!skipTt && !inCheck && victim != NO_PIECE && promo == 0) {
-                if (!seeGE(*pos, move, -50)) skipTt = true;
-                else if (best + PIECE_VALUES[victim] + 250 <= alpha) skipTt = true;
+                // v1.4.25 (B2): the 1-cycle delta test runs before the
+                // recursive seeGE — both are pure continue filters, so the
+                // order swap is bit-exact and skips SEE entirely on every
+                // delta-pruned capture.
+                if (best + PIECE_VALUES[victim] + 250 <= alpha) skipTt = true;
+                else if (!seeGE(*pos, move, -50)) skipTt = true;
             }
             if (!skipTt && inCheck && movePiece(move) != KING && !isEPMove(move) &&
                 !(qEvasionMask & bitOf(moveTo(move)))) skipTt = true;
@@ -2460,14 +2951,28 @@ struct Searcher::Worker {
                             alpha = score;
                             if (alpha >= beta) {
                                 storeQ(alphaIn, beta, best, move, ttEvalStore, ply);
-                                return best;
+                                return best;  // cutoff BEFORE generate() — v1.4.28 (B1)
                             }
                         }
                     }
                 }
             }
-            qTtHandled = true;
         }
+        // v1.4.28 (B1): generate only now (the probe either returned or
+        // left the TT move consumed at slot 0).
+        int count = generate(*pos, moves, qCapturesOnly);
+        int qTtIdx = -1;
+        if (qTtProbeOk) {
+            for (int i = 0; i < count; i++)
+                if (moves[i] == ttMove) { qTtIdx = i; break; }
+            if (qTtIdx >= 0 && qTtIdx != 0) {
+                Move tm = moves[0];
+                moves[0] = moves[qTtIdx];
+                moves[qTtIdx] = tm;
+            }
+        }
+        bool qTtHandled = qTtProbeOk;  // slot 0 consumed by the TT move
+        int quietChecksLeft = -1;  // -1 = not counted (qply > 0 or in check)
         if (!inCheck && qply == 0) {
             quietChecksLeft = 0;
             for (int i = qTtHandled ? 1 : 0; i < count; i++) {
@@ -2507,13 +3012,26 @@ struct Searcher::Worker {
             // checkers() test (rook checks + exotic king-vacation lines) but
             // also with a pre-move SEE.
             if (!inCheck && qply == 0 && victim == NO_PIECE && promo == 0) {
+                // v1.4.24 (L4): consume a unit of quietChecksLeft for every
+                // checking quiet / castle popped. The counting pass above
+                // counted exactly these moves (every castle, every
+                // gives-check quiet), so once the last one is popped
+                // quietChecksLeft hits 0 and the VERY NEXT quiet breaks at
+                // the top of the loop — instead of re-running argMaxScores
+                // + givesCheckQuiet across the remaining 25-35 non-checking
+                // quiets only to skip them all via `continue`. The skipped
+                // iterations have no side effects (the buffer permutation
+                // is dead state, givesCheckQuiet/seeGE are pure), so the
+                // searched tree is bit-identical.
                 if (isCastleMove(move)) {
+                    quietChecksLeft--;
                     pos->makeMove(move);
                     bool castleChecks = pos->checkers() != 0;
                     pos->unmakeMove();
                     if (!castleChecks || !seeGE(*pos, move, 0)) continue;
                 } else {
                     if (!givesCheckQuiet(*pos, move)) continue;
+                    quietChecksLeft--;
                     if (!seeGE(*pos, move, 0)) continue;
                 }
             }
@@ -2529,13 +3047,16 @@ struct Searcher::Worker {
             // sacrifice (e.g. QxR into a defended pawn, SEE -425) at full
             // cost in every single node.
             if (!inCheck && victim != NO_PIECE && promo == 0) {
-                // Skip clearly losing captures.
-                if (!seeGE(*pos, move, -50)) continue;
                 // Delta pruning.
                 // v1.3.1 lever: margin 150 -> 250 — the tighter margin
                 // dropped borderline-winning captures whose victim value
                 // straddled the alpha gap. Measured: ≈ +13 ± 9 (5k nodes).
+                // v1.4.25 (B2): moved before the recursive seeGE (both are
+                // pure continue filters — bit-exact, skips SEE on every
+                // delta-pruned capture).
                 if (best + PIECE_VALUES[victim] + 250 <= alpha) continue;
+                // Skip clearly losing captures.
+                if (!seeGE(*pos, move, -50)) continue;
             }
 
             // v1.4.4: provably-illegal in-check skip (bit-exact, same
@@ -2600,38 +3121,111 @@ struct Searcher::Worker {
     // Move ordering
     // ------------------------------------------------------------------
 
-    Move scoreMoves(Move *moves, int32_t *scores, int count, Move ttMove, int ply) {
+    // v1.4.26 (B4) / v1.4.27 (B2): per-node quiet-history ROW set. The 8
+    // row bases are a pure function of (us, ply, stack[ply-1..ply-4],
+    // pawnKey) — identical for every move made at this node — but
+    // quietHistoryValue, bumpQuiet, updateCutoffStats AND scoreMoves each
+    // recomputed them (6-8 int multiplies + stack loads per call, ~600k+
+    // redundant computations per bench 14). Hoisted once per alphaBeta
+    // node and shared (v1.4.27: scoreMoves takes the row set as a
+    // parameter — it recomputed all 8 pointers a second time per node).
+    // A null row means the corresponding history term is inapplicable at
+    // this ply (guard moves / king or missing stack move) — exactly the
+    // condition the per-call forms tested. Bit-exact: same addresses,
+    // same loads, same values; the tables may be mutated between uses but
+    // the ROW POINTERS are stable for the node's lifetime.
+    struct QuietHistRows {
+        int16_t *mh;    // mainHist + us*384
+        int16_t *ft;    // fromToHist + us*4096
+        int16_t *lp;    // lowPlyHist[ply<=2 ? 0 : 1]
+        int16_t *ph;    // pawnHist + us*STRIDE + bucket*384
+        int16_t *fh;    // followupHist row (zero row if inapplicable)
+        int16_t *ch;    // counterHist row    (zero row if inapplicable)
+        int16_t *c3;    // contHist3 row      (zero row if inapplicable)
+        int16_t *c4;    // contHist4 row      (zero row if inapplicable)
+    };
+
+    // v1.4.27 (Prev-B3): the shared all-zero continuation row. Inapplicable
+    // continuation slots point here instead of nullptr, so the READ paths
+    // (scoreMoves, quietHistoryValueRows) run branch-free — the zero row
+    // contributes exactly the 0 the null branch would have skipped.
+    // (Bit-exact: adding 0/4 or 0/8 equals the skipped add.) The WRITE
+    // path (bumpQuietRows) compares against this row so the shared
+    // constant is never written.
+    alignas(64) static inline int16_t kZeroHistRow[384] = {};
+
+    QuietHistRows makeQuietHistRows(int us, int ply) {
+        QuietHistRows r;
+        r.mh = &mainHist[us * 384];
+        r.ft = &fromToHist[us * 4096];
+        r.lp = &lowPlyHist[ply <= 2 ? 0 : 1][0];
+        r.ph = &pawnHist[us * PAWN_HIST_STRIDE +
+                         (int)(pos->pawnKey & PAWN_HIST_MASK) * 384];
+        r.fh = r.ch = r.c3 = r.c4 = kZeroHistRow;  // Prev-B3: zero row
+        if (ply >= 2) {
+            Move p = stack[ply - 2];
+            if (p != MOVE_NONE && movePiece(p) < 6)
+                r.fh = &followupHist[us * 147456 +
+                                      (movePiece(p) * 64 + moveTo(p)) * 384];
+        }
+        if (ply >= 1) {
+            Move p = stack[ply - 1];
+            if (p != MOVE_NONE && movePiece(p) < 6)
+                r.ch = &counterHist[us * 147456 +
+                                     (movePiece(p) * 64 + moveTo(p)) * 384];
+        }
+        if (ply >= 3) {
+            Move p = stack[ply - 3];
+            if (p != MOVE_NONE && movePiece(p) < 6)
+                r.c3 = &contHist3[us * 147456 +
+                                   (movePiece(p) * 64 + moveTo(p)) * 384];
+        }
+        if (ply >= 4) {
+            Move p = stack[ply - 4];
+            if (p != MOVE_NONE && movePiece(p) < 6)
+                r.c4 = &contHist4[us * 147456 +
+                                   (movePiece(p) * 64 + moveTo(p)) * 384];
+        }
+        return r;
+    }
+
+    Move scoreMoves(Move *moves, int32_t *scores, int count, Move ttMove, int ply,
+                    const QuietHistRows &hr, int startIdx = 0) {
+        // v1.4.25 (B4): history row pointers hoisted out of the per-move
+        // loop (one indexed base per table instead of a base + offset
+        // computation per move), and a startIdx parameter — the TT staging
+        // swaps the TT move to slot 0 and the suffix loop starts at 1, so
+        // scoring slot 0 again is dead work whose value is never read.
+        // v1.4.27 (B2): the 8 row pointers arrive as the caller's hoisted
+        // QuietHistRows (identical addresses — the same pure function of
+        // (us, ply, stack, pawnKey) — recomputed zero times here instead
+        // of once per node). Bit-exact.
         int us = pos->sideToMove;
         Move k1 = killers[ply * 2];
         Move k2 = killers[ply * 2 + 1];
         Move prevOpp = ply >= 1 ? stack[ply - 1] : MOVE_NONE;
-        Move prevOwn = ply >= 2 ? stack[ply - 2] : MOVE_NONE;
         int prevOppIdx = (prevOpp != MOVE_NONE && movePiece(prevOpp) < 6)
                              ? (movePiece(prevOpp) * 64 + moveTo(prevOpp))
                              : -1;
-        int prevOwnIdx = (prevOwn != MOVE_NONE && movePiece(prevOwn) < 6)
-                             ? (movePiece(prevOwn) * 64 + moveTo(prevOwn))
-                             : -1;
         Move counterMove = prevOppIdx >= 0 ? counterMoves[(us ^ 1) * 384 + prevOppIdx]
                                            : MOVE_NONE;
-        int followBase = prevOwnIdx >= 0 ? us * 147456 + prevOwnIdx * 384 : -1;
-        int counterBase = prevOppIdx >= 0 ? us * 147456 + prevOppIdx * 384 : -1;
-        Move prev3 = ply >= 3 ? stack[ply - 3] : MOVE_NONE;
-        Move prev4 = ply >= 4 ? stack[ply - 4] : MOVE_NONE;
-        int prev3Idx = (prev3 != MOVE_NONE && movePiece(prev3) < 6)
-                           ? (movePiece(prev3) * 64 + moveTo(prev3))
-                           : -1;
-        int prev4Idx = (prev4 != MOVE_NONE && movePiece(prev4) < 6)
-                           ? (movePiece(prev4) * 64 + moveTo(prev4))
-                           : -1;
-        int c3Base = prev3Idx >= 0 ? us * 147456 + prev3Idx * 384 : -1;
-        int c4Base = prev4Idx >= 0 ? us * 147456 + prev4Idx * 384 : -1;
+
+        // v1.4.25 (B4) hoisted rows (v1.4.27 B2: from the caller's hr).
+        const int16_t *mhRow = hr.mh;
+        const int16_t *ftRow = hr.ft;
+        const int16_t *lpRow = hr.lp;
+        const int16_t *phRow = hr.ph;
+        const int16_t *fhRow = hr.fh;
+        const int16_t *chRow = hr.ch;
+        const int16_t *c3Row = hr.c3;
+        const int16_t *c4Row = hr.c4;
+        const int16_t *capRow = &captureHist[us * 2304];
 
         // (v1.4.7: the enemyPawns/enemyPawnAtt precompute that used to live
         // here was dead work — six lines of shifts/masks per main-search
         // node whose results no scoring branch ever read. Removed.)
 
-        for (int i = 0; i < count; i++) {
+        for (int i = startIdx; i < count; i++) {
             Move m = moves[i];
             int pieceIdx = movePiece(m) * 64 + moveTo(m);
             if (m == ttMove) {
@@ -2642,9 +3236,9 @@ struct Searcher::Worker {
             } else if (isCapture(m)) {
                 // Continuation context ranks equal-value captures: a knight
                 // recapture that answers the threat is usually right.
-                int ch = captureHist[us * 2304 + pieceIdx * 6 + moveCaptured(m)] / 16;
-                if (counterBase >= 0) ch += counterHist[counterBase + pieceIdx] / 16;
-                if (followBase >= 0) ch += followupHist[followBase + pieceIdx] / 16;
+                int ch = capRow[pieceIdx * 6 + moveCaptured(m)] / 16;
+                ch += chRow[pieceIdx] / 16;  // Prev-B3: zero row when n/a
+                ch += fhRow[pieceIdx] / 16;
                 // v1.1: proper MVV-LVA (victim-major — the old
                 // 16*victim − 40*attacker let the attacker term dominate
                 // and misordered mixed captures like NxQ vs PxR) plus the
@@ -2680,26 +3274,25 @@ struct Searcher::Worker {
             } else if (m == counterMove) {
                 scores[i] = 2880000;
             } else {
-                int32_t s = mainHist[us * 384 + pieceIdx] / 4;
+                int32_t s = mhRow[pieceIdx] / 4;
                 // v1.4.0 lever: from-to history (square-pair signal — same
                 // /4 weight family as the main history) and low-ply history
                 // (from-to at the top of the tree, where ordering is worth
                 // the most; /2 — the signal is sparser and sharper there).
                 int32_t ft = moveFrom(m) * 64 + moveTo(m);
-                s += fromToHist[us * 4096 + ft] / 4;
+                s += ftRow[ft] / 4;
                 if (ply <= 4)
-                    s += lowPlyHist[ply <= 2 ? 0 : 1][ft] / 2;
+                    s += lpRow[ft] / 2;
                 // v1.3.1 lever: pawn-structure history — same feature space
                 // as the main history (piece x to, mover side), refined by
                 // the node's pawn-key bucket. Weighted like the main
                 // history (the /4 family), with the same gravity
                 // bonus/malus updates.
-                s += pawnHist[us * PAWN_HIST_STRIDE +
-                              (int)(pos->pawnKey & PAWN_HIST_MASK) * 384 + pieceIdx] / 4;
-                if (followBase >= 0) s += followupHist[followBase + pieceIdx] / 4;
-                if (counterBase >= 0) s += counterHist[counterBase + pieceIdx] / 4;
-                if (c3Base >= 0) s += contHist3[c3Base + pieceIdx] / 8;
-                if (c4Base >= 0) s += contHist4[c4Base + pieceIdx] / 8;
+                s += phRow[pieceIdx] / 4;
+                s += fhRow[pieceIdx] / 4;  // Prev-B3: zero rows when n/a
+                s += chRow[pieceIdx] / 4;
+                s += c3Row[pieceIdx] / 8;
+                s += c4Row[pieceIdx] / 8;
                 scores[i] = clampI(s, -100000, 100000);
             }
         }
@@ -2760,6 +3353,26 @@ struct Searcher::Worker {
         }
     }
 
+    int quietHistoryValueRows(Move move, const QuietHistRows &hr) const {
+        int pieceIdx = movePiece(move) * 64 + moveTo(move);
+        // (v1.4.0 tested: from-to + low-ply history INSIDE the LMR value
+        // measured neutral-at-best — the quietHistoryValue distribution is
+        // calibrated to the LMR gates (hist<=0 extra reduction,
+        // >=2500/4200 de-reductions, the -200 prune gate), and the extra
+        // terms shift the profile. The new histories stay in the ORDERING
+        // path (scoreMoves), where they are a pure signal add.)
+        int v = hr.mh[pieceIdx] / 4;
+        v += hr.ph[pieceIdx] / 4;
+        v += hr.fh[pieceIdx] / 8;  // Prev-B3: zero rows when n/a
+        v += hr.ch[pieceIdx] / 8;
+        v += hr.c3[pieceIdx] / 8;
+        v += hr.c4[pieceIdx] / 8;
+        return v;
+    }
+
+    // (v1.4.26 B4: the un-hoisted quietHistoryValue remains for any
+    // context without a prepared row set — currently unused by the search
+    // paths, kept as the reference form.)
     int quietHistoryValue(Move move, int ply, int moverSide, int pawnBucket) {
         // moverSide: the color making `move` (the node's side to move).
         // v4.0 fix: both call sites run AFTER makeMove, where
@@ -2772,12 +3385,6 @@ struct Searcher::Worker {
         int us = moverSide;
         int pieceIdx = movePiece(move) * 64 + moveTo(move);
         int v = mainHist[us * 384 + pieceIdx] / 4;
-        // (v1.4.0 tested: from-to + low-ply history INSIDE the LMR value
-        // measured neutral-at-best — the quietHistoryValue distribution is
-        // calibrated to the LMR gates (hist<=0 extra reduction,
-        // >=2500/4200 de-reductions, the -200 prune gate), and the extra
-        // terms shift the profile. The new histories stay in the ORDERING
-        // path (scoreMoves), where they are a pure signal add.)
         v += pawnHist[us * PAWN_HIST_STRIDE + pawnBucket * 384 + pieceIdx] / 4;
         if (ply >= 2) {
             Move p = stack[ply - 2];
@@ -2821,13 +3428,57 @@ struct Searcher::Worker {
     static int gravity(int h, int b) {
         // v1.4.5: signed-h gravity (same fix as corrGravity; see the
         // negative-quadrant analysis there).
-        int64_t ab = b < 0 ? -(int64_t)b : (int64_t)b;
-        int64_t v = (int64_t)h + b - ((int64_t)h * ab) / 16384;
+        // v1.4.26 (B4): 32-bit arithmetic (was int64 promotion + a 64-bit
+        // division). |h| <= 32767 (int16 tables) and every shipped caller
+        // bounds |b| by 2*depth*depth with depth <= 128 in every reachable
+        // tree (maxDepth 64; extensions add at most +1 per ply and the
+        // search cannot exceed MAX_PLY), so |h*ab| <= 32767*32768 < 2^31.
+        // The ab >= 65538 guard is a pure safety net for absurd extension
+        // chains: it reproduces the old 64-bit result exactly. Integer
+        // division truncates toward zero at both widths — bit-identical.
+        int ab = b < 0 ? -b : b;
+        int v;
+        if (ab >= 65538) {
+            v = (int)((int64_t)h + b - ((int64_t)h * ab) / 16384);
+        } else {
+            v = h + b - (h * ab) / 16384;
+        }
         if (v > 32767) v = 32767;
         if (v < -32768) v = -32768;
-        return (int)v;
+        return v;
     }
 
+    // v1.4.26 (B4): row-hoisted bumpQuiet — same 8-table gravity update,
+    // same gates (lowPly only at ply 1-4; continuation rows only when the
+    // hoisted row is non-null), same cell addresses. Bit-identical writes.
+    void bumpQuietRows(Move move, int b, int ply, const QuietHistRows &hr) {
+        int pieceIdx = movePiece(move) * 64 + moveTo(move);
+        int ft = moveFrom(move) * 64 + moveTo(move);
+        hr.mh[pieceIdx] = (int16_t)gravity(hr.mh[pieceIdx], b);
+        // v1.4.0 lever: from-to history (+ low-ply refinement at ply 1-4)
+        // — same gravity update as every other quiet table.
+        hr.ft[ft] = (int16_t)gravity(hr.ft[ft], b);
+        if (ply >= 1 && ply <= 4)
+            hr.lp[ft] = (int16_t)gravity(hr.lp[ft], b);
+        // v1.3.1 lever: pawn-structure history update — keyed by the pawn-key
+        // bucket of the node the move was made in (encoded in the hoisted
+        // ph row; pos is back at the node when this runs).
+        hr.ph[pieceIdx] = (int16_t)gravity(hr.ph[pieceIdx], b);
+        // Prev-B3: fh/ch/c3/c4 are never null now — the guard is a pointer
+        // compare against the shared zero row (a write there would corrupt
+        // every node's phantom row).
+        if (hr.fh != kZeroHistRow)
+            hr.fh[pieceIdx] = (int16_t)gravity(hr.fh[pieceIdx], b);
+        if (hr.ch != kZeroHistRow)
+            hr.ch[pieceIdx] = (int16_t)gravity(hr.ch[pieceIdx], b);
+        if (hr.c3 != kZeroHistRow)
+            hr.c3[pieceIdx] = (int16_t)gravity(hr.c3[pieceIdx], b);
+        if (hr.c4 != kZeroHistRow)
+            hr.c4[pieceIdx] = (int16_t)gravity(hr.c4[pieceIdx], b);
+    }
+
+    // (v1.4.26 B4: the un-hoisted bumpQuiet remains as the reference form;
+    // the search paths all use bumpQuietRows with the per-node row set.)
     void bumpQuiet(Move move, int us, int b, int ply, int pawnBucket) {
         int pieceIdx = movePiece(move) * 64 + moveTo(move);
         int ft = moveFrom(move) * 64 + moveTo(move);
@@ -2884,8 +3535,12 @@ struct Searcher::Worker {
         captureHist[idx] = (int16_t)gravity(captureHist[idx], b);
     }
 
+    // v1.4.26 (B4): takes the per-node QuietHistRows (hoisted by alphaBeta)
+    // — the cutoff bonus, every malus bump and (via bumpQuietRows) every
+    // table write reuse the same row set instead of recomputing 6-8 row
+    // offsets per call. Same cells, same gravity — bit-identical.
     void updateCutoffStats(Move move, bool quiet, Move *tried, int triedCount, int depth,
-                           int ply) {
+                           int ply, const QuietHistRows &hr) {
         // v1.4.6: 1.5*d^2 -> 2*d^2. With the v1.4.5 signed gravity the
         // negative tail no longer amplifies itself toward the clamp, so the
         // usable learning band narrowed — the bonus side carries the whole
@@ -2893,16 +3548,13 @@ struct Searcher::Worker {
         // rejection was measured under the broken |h|*|b| gravity.)
         int b = 2 * depth * depth;
         int us = pos->sideToMove;
-        // v1.3.1: the node's pawn-key bucket for the pawn-history updates
-        // (pos is back at this node — the cutoff store runs after unmake).
-        int pawnBucket = (int)(pos->pawnKey & PAWN_HIST_MASK);
         if (quiet) {
             // Killers.
             if (killers[ply * 2] != move) {
                 killers[ply * 2 + 1] = killers[ply * 2];
                 killers[ply * 2] = move;
             }
-            bumpQuiet(move, us, b, ply, pawnBucket);
+            bumpQuietRows(move, b, ply, hr);
             // Counter-move: this quiet move refuted the parent's move.
             if (ply >= 1) {
                 Move prev = stack[ply - 1];
@@ -2926,7 +3578,7 @@ struct Searcher::Worker {
             Move tm = tried[q];
             if (tm == move) continue;
             if (isQuiet(tm)) {
-                if (quiet) bumpQuiet(tm, us, -b, ply, pawnBucket);
+                if (quiet) bumpQuietRows(tm, -b, ply, hr);
             } else if (isCapture(tm)) {
                 bumpCapture(tm, us, -(b / 2));
             }
@@ -3063,6 +3715,17 @@ SearchResult Searcher::think(
             effLimits = cut;
         }
     }
+
+    // v1.4.27 (T3b): callers without game-level context leave lastScore at
+    // the -33000 sentinel. Fill it from this Searcher's own per-side
+    // record so the v1.4.26 T3 cross-move falling-eval instability trigger
+    // activates exactly as it does under the host harness (which tracks
+    // the same pair itself and therefore never hits this fill). A
+    // caller-provided real score always wins; the fill is inert on every
+    // non-adaptive path (lastScore is read only through the TimeManager).
+    if (effLimits.lastScore == -33000 && effLimits.trackLastScore &&
+        lastScoreDepth_[board.sideToMove] > 0)
+        effLimits.lastScore = lastScoreBySide_[board.sideToMove];
 
     int nThreads = effLimits.threads;
     if (nThreads < 1) nThreads = 1;
@@ -3202,6 +3865,17 @@ SearchResult Searcher::think(
                 }
             }
         }
+    }
+
+    // v1.4.27 (T3b): record this side's completed-search score (mover POV)
+    // for the next think() of the same side — the engine-side mirror of
+    // the host harness's g_lastScoreBySide bookkeeping (score stored as
+    // returned, mate magnitudes included; the -30000 real-score guard in
+    // timeman.h handles those).
+    {
+        int stm = board.sideToMove;
+        lastScoreBySide_[stm] = result.score;
+        lastScoreDepth_[stm] = result.depth;
     }
 
     result.nodes = totalNodes() ? totalNodes() : result.nodes;

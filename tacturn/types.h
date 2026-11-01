@@ -71,7 +71,10 @@ inline bool isDoublePush(Move m) { return (m & FLAG_DOUBLE) != 0; }
 inline bool isCapture(Move m) { return moveCaptured(m) != NO_PIECE; }
 inline bool isQuiet(Move m) { return moveCaptured(m) == NO_PIECE && movePromo(m) == 0; }
 
-extern const int PIECE_VALUES[7];  // P N B R Q K NO_PIECE (centipawns)
+// v1.4.28 (B2): inline constexpr — every translation unit folds constant
+// indices at compile time instead of loading through the extern symbol
+// (the search hot paths index PIECE_VALUES with loop-invariant pieces).
+inline constexpr int PIECE_VALUES[7] = {100, 320, 330, 500, 950, 20000, 0};
 
 char pieceFenChar(int type);
 int pieceTypeFromFen(char c);

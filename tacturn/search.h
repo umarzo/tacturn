@@ -90,7 +90,25 @@ struct SearchLimits {
     uint64_t nodeLimit = 0;          // 0 = unlimited (fixed-node testing / datagen)
     bool adaptiveTime = false;       // complexity-scaled budget + instability extension
     int depthFloor = 8;              // never stop below this completed depth (adaptive)
-    int lastScore = 0;               // previous move's score (game-level context)
+    // v1.4.26 (T3): -INFINITE default. The old 0 default made an unset
+    // lastScore indistinguishable from "the previous move was dead equal",
+    // and timeman's cross-move falling-eval test
+    // (lastScore - score > 30) treated 0 as real history — permanently
+    // locking fallingEval/unstable_ true on every iteration of every move
+    // whenever the engine stood below -30 cp in clocked play. Callers that
+    // know the true previous score override it (the host harness tracks it
+    // per side); the sentinel keeps every other caller honest via the
+    // real-score guard in timeman.h.
+    int lastScore = -33000;         // previous move's score (game-level context; -33000 = unknown sentinel, matches Searcher::INFINITE)
+    // v1.4.27 (T3b): opt-in to the Searcher's OWN per-side last-score
+    // record filling the -33000 sentinel (the Android JNI / api.cpp play
+    // path, which has no host harness to track it). The host harness
+    // leaves this false: it manages lastScore itself, and an auto-fill
+    // would leak the previous game's final score into a new game's first
+    // move (its own g_lastScoreBySide resets on ucinewgame; the engine's
+    // record only resets via Searcher::resetGameContext, which
+    // GameSession::reset calls).
+    bool trackLastScore = false;
     int jitterCp = 0;                // root-only random noise for weaker levels
     int threads = 1;                 // Lazy-SMP thread count
     uint64_t rngSeed = 0;            // 0 -> seeded from the clock
@@ -161,6 +179,29 @@ public:
 
 private:
     struct Worker;
+
+    // v1.4.27 (T3b): in-engine per-side last-score tracking, so callers
+    // that don't carry game-level context (Android JNI, api.cpp direct
+    // calls) still activate the v1.4.26 T3 cross-move falling-eval
+    // instability trigger. Mirrors the host harness's g_lastScoreBySide /
+    // g_lastScoreDepth pair: -33000 sentinel until a completed search has
+    // recorded a real score for that side (mover POV). A caller-provided
+    // limits.lastScore (anything other than the sentinel) always wins.
+    // lastScore is consumed ONLY on the adaptive-time path, so fixed
+    // movetime / fixed node / bench callers are untouched.
+    int lastScoreBySide_[2] = {-33000, -33000};
+    int lastScoreDepth_[2] = {0, 0};
+
+public:
+    /** v1.4.27 (T3b): clear the per-side last-score record (new game).
+     *  Called by GameSession::reset so ucinewgame / tacturn_reset start
+     *  every game from the honest -33000 sentinel. */
+    void resetGameContext() {
+        lastScoreBySide_[0] = lastScoreBySide_[1] = -33000;
+        lastScoreDepth_[0] = lastScoreDepth_[1] = 0;
+    }
+
+private:
 
     uint64_t totalNodes();
     Worker *worker(int i);

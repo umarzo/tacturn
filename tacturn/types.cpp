@@ -4,7 +4,7 @@
 
 namespace tacturn {
 
-const int PIECE_VALUES[7] = {100, 320, 330, 500, 950, 20000, 0};
+// (v1.4.28 B2: PIECE_VALUES is inline constexpr in types.h now.)
 
 char pieceFenChar(int type) {
     static const char CH[6] = {'P', 'N', 'B', 'R', 'Q', 'K'};
