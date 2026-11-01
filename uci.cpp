@@ -331,6 +331,18 @@ void formatScore(char *out, size_t outLen, int score) {
 // ----------------------------------------------------------------
 // runGo — runs on the SEARCH WORKER THREAD (main thread keeps stdin)
 // ----------------------------------------------------------------
+// v1.4.26 (T3): per-side previous-score tracking for clocked play. The
+// adaptive time manager's cross-move falling-eval test needs the score of the
+// mover's PREVIOUS own move; the score recorded here is the mover-POV score of
+// the last completed search of that side. An arbitrary `position` re-base or a
+// new game resets it to unknown.
+static int g_lastScoreBySide[2] = {-33000, -33000};
+static int g_lastScoreDepth[2] = {0, 0};
+static void uciResetLastScore() {
+    g_lastScoreBySide[0] = g_lastScoreBySide[1] = -33000;
+    g_lastScoreDepth[0] = g_lastScoreDepth[1] = 0;
+}
+
 int runGo(GameSession &g, const UciOptions &opt, const std::string &goArgs,
           bool printInfo, std::atomic<bool> *searchingFlag = nullptr) {
     // The "searching" flag MUST drop before bestmove is printed: a GUI sends
@@ -432,6 +444,12 @@ int runGo(GameSession &g, const UciOptions &opt, const std::string &goArgs,
         lim.hardMoveTimeMs = hard;
         // v1.4.11: in time trouble the depth floor shrinks too.
         lim.depthFloor = soft < 120 ? 4 : 8;
+        // v1.4.26 (T3): the true per-side previous score (mover POV).
+        {
+            int stm = g.board.sideToMove;
+            lim.lastScore = g_lastScoreDepth[stm] > 0 ? g_lastScoreBySide[stm]
+                                                      : Searcher::INFINITE * -1;
+        }
         // v1.4.0: clocked play uses the adaptive time manager (the app's
         // play mode) — the soft/hard split above becomes the tm's base/cap.
         lim.adaptiveTime = true;
@@ -504,6 +522,13 @@ int runGo(GameSession &g, const UciOptions &opt, const std::string &goArgs,
         std::fflush(stdout);
     });
 
+    // v1.4.26 (T3): remember this side's score for its next clocked `go`.
+    {
+        int stm = g.board.sideToMove;
+        g_lastScoreBySide[stm] = r.score;
+        g_lastScoreDepth[stm] = r.depth;
+    }
+
     char mv[8];
     if (r.bestMove == MOVE_NONE) {
         searchDone();
@@ -563,7 +588,7 @@ int main(int argc, char **argv) {
     // other UCI engine -- keep reading commands until "quit" / EOF.
     // (V1 used to run a startpos "fingerprint" here and exit, which looked
     // like a crash on double-click and tripped on a stale expected value.
-    // The identity check is `bench 9` -> Total nodes: 230912.)
+    // The identity check is `bench 9` -> Total nodes: 165888.)
     if (argc == 1 && isatty(0)) {
         std::fprintf(stderr,
                      "%s by %s -- UCI chess engine (api v%d).\n"
@@ -652,6 +677,7 @@ int main(int argc, char **argv) {
             g->clearSearchTable();
             lastFen = Position::START_FEN;
             gameMoves.clear();
+            uciResetLastScore();  // v1.4.26 (T3)
         } else if (tok == "setoption") {
             // [CCRL] Robust parsing: multi-word names + optional value,
             // e.g. "setoption name Clear Hash" / "setoption name OwnBook
@@ -718,28 +744,52 @@ int main(int argc, char **argv) {
                 while (parser >> f && f != "moves") fen += f + " ";
                 if (f == "moves") sub = "moves";
             }
-            if (!fen.empty()) {
-                if (!g->setFen(fen.c_str())) {
-                    std::printf("info string invalid FEN\n");
-                    std::fflush(stdout);
-                    continue;
-                }
-            }
             if (sub == "moves") {
                 std::string mstr;
                 while (parser >> mstr) moves.push_back(mstr);
             }
-            for (const std::string &mstr : moves) {
-                Move m = findUciMove(*g, mstr.c_str());
-                if (m == MOVE_NONE) {
-                    std::printf("info string illegal move %s\n", mstr.c_str());
+            // v1.4.27 (T1): INCREMENTAL position continuation. GUIs send
+            // `position startpos moves m1 ... mN` before every go; when the
+            // command is a strict continuation of the last one (same base,
+            // same prefix, only appended moves) apply just the new suffix
+            // (O(1) per move) and keep the cross-move score context (T3).
+            // Any re-base (new FEN, rewind, divergent prefix) resets it.
+            std::string baseFen = fen.empty() ? std::string(Position::START_FEN) : fen;
+            bool isCont = (!lastFen.empty() && baseFen == lastFen &&
+                           moves.size() >= gameMoves.size());
+            if (isCont) {
+                for (size_t i = 0; i < gameMoves.size(); i++) {
+                    if (moves[i] != gameMoves[i]) { isCont = false; break; }
+                }
+            }
+            if (!isCont) {
+                if (!g->setFen(baseFen.c_str())) {
+                    std::printf("info string invalid FEN\n");
                     std::fflush(stdout);
+                    continue;
+                }
+                gameMoves.clear();
+                uciResetLastScore();
+            }
+            bool okMoves = true;
+            for (size_t i = gameMoves.size(); i < moves.size(); i++) {
+                Move m = findUciMove(*g, moves[i].c_str());
+                if (m == MOVE_NONE) {
+                    std::printf("info string illegal move %s\n", moves[i].c_str());
+                    std::fflush(stdout);
+                    okMoves = false;
                     break;
                 }
                 g->makeMove(m);
             }
-            lastFen = fen.empty() ? g->fen() : fen;
-            gameMoves = moves;
+            if (okMoves) {
+                lastFen = baseFen;
+                gameMoves = moves;
+            } else {
+                // Partial apply: stop tracking; the next full command re-syncs.
+                lastFen.clear();
+                gameMoves.clear();
+            }
         } else if (tok == "go") {
             // [CCRL] Book handling: the UCI harness never used the engine's
             // book; OwnBook (default false) keeps that explicit. When a

@@ -1,4 +1,77 @@
-# TacTurn V1.2 — Release Notes (internal 1.4.20)
+# TacTurn V1.2 — Release Notes (rebuilt, internal 1.4.28)
+
+Author: **Umar Khan** · License: MIT · `id name TacTurn V1.2`.
+Binaries: `TacTurn-V1.2-x86-64[-v3|-v4][.exe]`. **This replaces the earlier
+V1.2 release.** Notes of earlier builds are kept below, marked as
+withdrawn/superseded.
+
+## IMPORTANT — correction of earlier releases
+
+- The **first V1.2 build (internal 1.4.20) was a regression.** Its net had
+  collapsed to a near-constant (it contributed nothing; measured about
+  −300 Elo in-family and ~2822 on the CCRL Blitz scale vs 3274 for 1.4.16).
+- Root cause (`HISTORY.md` §58): the match harness reported every gate result
+  **with the sign flipped**, so every "accepted" gain in 1.4.12–1.4.20 was in
+  fact a loss. The earlier V1.1 (1.4.16, net v99) build is also affected:
+  an independent audit found it **~75 Elo weaker** than the original net.
+  All Elo figures published in earlier notes/READMEs for those builds are
+  **retracted**.
+- **Lc0 data disclosure:** the Lc0-derived training experiments (1.4.18–1.4.20
+  and a 1.4.23 re-test) were rejected. **This release contains no net trained
+  on Lc0 data.** Credits for the data source are in the README.
+
+## What this release is
+
+- **Net:** `v96pre` restored — weight-for-weight identical to the net in the
+  original V1 (Stockfish-17.1-labeled training, +162.0 ± 16.6 Elo over
+  net-off, pre-audit measurement).
+- **Engine code: 1.4.23 → 1.4.28** (the verified, referee-gated work after the
+  audit; full details in `HISTORY.md` §61–§63 and the version notes):
+  - 1.4.23: three suspect search levers reverted (continuation-correction
+    history, TT-bound-aware quiet LMR, single-reply extension): +13.9 ± 5.9
+    @ 30 ms, +18.7 ± 7.2 @ 60 ms, SPRT H1.
+  - 1.4.24–1.4.25: bit-exact speed levers (vectorized argmax, fused NNUE
+    inference, slider-table fix — magic-mask bug fixed, tables 10x smaller),
+    search fixes (dead quiet-check counter, SEE shortcuts).
+  - 1.4.26: singular-extension bug cluster fixed, NNUE speed pack v2,
+    time-management fixes (full-time utilization; per-side previous-score
+    tracking): +73.5 ± 19.0 @ 50 ms over 1.4.25.
+  - 1.4.27: fail-soft singular multi-cut, residual rounding consistency,
+    SIMD parity.
+  - 1.4.28: capture-history aging restored, partial-abort aspiration
+    fail-high salvage fix, further bit-exact speed work: +17.4 ± 9.4 pooled
+    (900 games) over 1.4.27.
+- **UCI host (this repo's `uci.cpp`):** everything from the earlier V1.1
+  audit stays (no exit on launch, reliable stop, correct Hash memory, robust
+  clock input, `Move Overhead`, real `movestogo`), plus the 1.4.26–1.4.27
+  host changes: per-side previous-score tracking for the time manager and
+  incremental `position` handling (O(1) per move instead of re-playing the
+  game).
+- **Bench identity:** `bench 9` = **165,888** and `bench 14` = **1,361,920**
+  nodes — identical to the author's own 1.4.28 build and identical on all
+  three ISA tiers.
+- Options unchanged: `Hash` 32 MB, `Move Overhead` 60 ms, `NNUEBlend` 77,
+  `StaticBlend` 72.
+
+## Verification
+
+- `bench 9` = 165,888 on `x86-64`, `x86-64-v3`, `x86-64-v4` (Linux builds).
+- `scripts/verify_uci.py`: 33 checks, all passing on all three Linux tiers;
+  plus a 30-ply self-play with incremental `position` strings, a rewind, an
+  illegal-move resync and a FEN re-base.
+- Windows `.exe` builds are cross-compiled with MinGW-w64 (static) from the
+  same source; they were not executed in the build environment — confirm on a
+  real Windows machine.
+- The "~3250 Elo" estimate from earlier READMEs is withdrawn; no verified
+  CCRL rating exists yet.
+
+---
+
+# [WITHDRAWN] first V1.2 build (internal 1.4.20) — notes kept only for transparency
+
+> **Do not use.** These notes described a net that was later shown to be a
+> regression; the Elo figures below came from a sign-inverted gate harness
+> and are retracted (see `HISTORY.md` §58). Superseded by the V1.2 build above.
 
 Author: **Umar Khan** · License: MIT · `id name TacTurn V1.2`.
 Binaries are named `TacTurn-V1.2-x86-64[-v3|-v4][.exe]`. **Replace all
@@ -39,7 +112,11 @@ kept below.
 
 ---
 
-# TacTurn V1.1 — previous release notes (internal 1.4.16, kept for history)
+# [SUPERSEDED] V1.1 build (internal 1.4.16) — kept for history
+
+> The 1.4.16 net it carried was later found ~75 Elo weaker than the net
+> restored in V1.2 (`HISTORY.md` §59, B1). Gain figures below were measured
+> with the sign-inverted harness and are retracted.
 
 Author: **Umar Khan** · License: MIT. The release stays **V1.1**
 (public V1 = internal 1.4.9; V1.1 = internal 1.4.16, `id name TacTurn V1.1`).

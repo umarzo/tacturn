@@ -5386,6 +5386,735 @@ net); the possibility that the trained direction HELPS once the
 exposure is fixed first (train-from-the-re-anchored-point, not
 re-anchor-after-train) is the named experiment for the next round.
 
+## 58. 1.4.21 — the regression incident: root cause, the bit-exact restoration, and the two harness fixes
+
+**The incident.** v1.4.20 measured 2822 ± 35 on the CCRL Blitz scale
+under replicated conditions — a ~450-Elo regression vs the CCRL-verified
+v1.4.16 champion (3274 ± 21). This section records the full forensic
+chain (external replication, binary bisection, weight-level analysis,
+and the recomputation of every stored gate JSON), the fix, and the two
+tooling changes that prevent recurrence.
+
+**Fact 1 — the engine code never changed.** With `UseNNUE=false` all five
+binaries (1.4.16-1.4.20) produce IDENTICAL bench trees (bench 1:
+nodes=34816 best=g1f3 score=15; bench 2: nodes=45056 best=d5e6 ...).
+The only differences across those releases are nnue_net.cpp and version
+strings. The regression therefore lives entirely in the net.
+
+**Fact 2 — the deployed nets were lobotomized.** `evalpos` probes on
+diverse positions (standard suite + 60 real positions mined from the
+external-test PGN):
+- v99 (1.4.16): residual mean +23 cp, sd 125.6, range -462..+321 — a
+  genuine, well-scaled positional evaluator.
+- v113 (1.4.20): residual mean +28.9 cp, sd 10.8, range +8..+47 — a
+  near-CONSTANT side-to-move bias. The B4 output biases alone are
+  +9..+52 cp per bucket; the weight-driven variation is noise-scale.
+  The three re-anchor rounds (s=0.45 -> 0.15 -> 0.25) replaced the
+  net's signal with an optimism constant.
+- A/B vs Simbelmyne (5+0.05, n=30 each, book exits from the external
+  PGN): 1.4.16 63.3%, 1.4.16-NNUE-off 41.7%, 1.4.20 35.0%,
+  1.4.20-NNUE-off 35.0%. The v113 net is worth exactly zero (on == off);
+  the v99 net was worth ~+150 Elo externally on the same rig. The
+  regression is the thrown-away net value, plus a small margin-misfit
+  tax from the baked-in bias.
+
+**Fact 3 — the gate harness reported every result with the SIGN
+FLIPPED.** match.py stores game results from A's POV
+(`a_won = white_won == a_is_white`) and the gate convention was
+A = champion / baseline, B = candidate. The printed `elo` and the SPRT
+LLR were computed on A's W-D-L, but every reader — the SPRT verdict
+text ("H1 ACCEPTED (candidate gains >= X)" fires when the CHAMPION
+gains >= X), the HISTORY tables, and the exposure-ladder decisions —
+treated that number as the candidate's gain. Recomputing every stored
+games/*.json gate record from §54-§57:
+
+| stored gate | A (champion) W-D-L | elo(A-B) | HISTORY recorded |
+|---|---|---|---|
+| sprt30/60_b600s45 (1.4.18 gate) | 149-68-73 / 148-78-74 | +93.2 / +87.5 | "+93.2 / +87.5 gains" |
+| sprt30/60_r2s015 (1.4.19 gate) | 93-24-27 / 92-16-25 | +172.0 / +192.6 | "+172.0 / +192.6 gains" |
+| sprt30/60_r3s025 (1.4.20 gate) | 423-242-332 / 274-149-189 | +31.8 / +48.6 | "+31.8 / +48.6 gains" |
+| ftb600_30/60 (1.4.17 gate) | 840-730-790 / 241-256-223 | +7.4 / +8.7 | "+7.4 / +8.7 gains" |
+| scr2_r2b600s015 (the "null control") | 139-36-25 | +225.0 | "+225.0" |
+
+Every "accepted" gate was a REGRESSION. The true ladder (in-family,
+their own data, correctly read): 1.4.17 = -7.4 vs 1.4.16, 1.4.18 =
+-93 vs 1.4.17, 1.4.19 = -172 vs 1.4.18, 1.4.20 = -31.8 vs 1.4.19 —
+cumulative ~-304 vs 1.4.16. Direct re-measurement (their runner,
+movetime 60, their 45 paired openings, n=100): 1.4.20 vs 1.4.16 =
+11-13-76 = **-269.4 ± 40.2** — i.e., the reported "self-play +280 at
+all TCs" was the sign-flipped mirror of the truth.
+
+**Fact 4 — the exposure ladders were inverted too.** The §56 ladder
+actual results (A = 1.4.18 champion): natural-scale trained net
+s=1.00: **-34.9 for A (the candidate was BETTER, +34.9)**; s=0.70
++63.2; s=0.50 +88.7; s=0.35 +139; s=0.25 +172.8; s=0.15 +225.0 (the
+SHIPPED 1.4.19 — the worst sensible point on the ladder); s=0.10
++200.2; s=0.05 +190.8. The true curve is monotonic: the more the
+residual was shrunk, the worse the engine got. The rounds selected
+their worst variants and shipped them. (The §55 and §57 ladders are the
+same story: natural-scale round-1 nets were +37..+43 over 1.4.17 while
+the shipped s=0.45 was -117; round-3's trained r3b1200s035 was +12.2
+over 1.4.19 while the shipped null19s025 was -47.)
+
+**Why the external number (-452) exceeds the in-family one (~-304).**
+The in-family ladder measures on the 45 fixed family openings where the
+HCE remains competent even netless; the external pool drags games into
+positions where the missing v99 knowledge (endgame conversions,
+unbalanced-material pricing, king-attack calibration) is worth more,
+and the CCRL-replica TC (10+0.1) is slower than the 30-60 ms gates,
+weighting eval quality higher. On this rig at 5+0.05 vs one opponent
+the gap measures -203 (63.3% vs 35.0%), bracketed by the two effects.
+
+**The fix — 1.4.21 = the 1.4.20 engine + the v99 net restored,
+bit-exact.** The v99 weight tables were extracted from the shipped
+1.4.16 binary (unstripped ELF; the eight nnue symbol ranges read
+directly from .rodata: FT_W 0x7ebc0+0x300000, FT_B 0x4880a0+0x400,
+L2_W 0x3878a0+0x100000, L2_B 0x4878a0+0x800, L3_W 0x37f0a0+0x8000,
+L3_B 0x3870a0+0x800, W4 0x37ec60+0x400, B4 0x37f060+0x40) and
+regenerated as nnue_net.cpp by scripts/training/extract_net.py.
+Proofs, all exact:
+- bench 9 totals 180,736 nodes — the documented §54 champion
+  fingerprint — and every per-position line matches the 1.4.16 binary
+  (nodes/best/score identical).
+- evalpos matches the 1.4.16 binary on every probe position (HCE and
+  residual, both unchanged).
+- perft 5 = 4,865,609, perft 6 = 119,060,324; fuzznnue 404,900
+  positions / 0 mismatches; fuzzsee and fuzzGivesCheck 0 mismatches.
+- vs Simbelmyne (same rig, n=30): 60.0% vs 1.4.16's 63.3% —
+  statistically identical, as a bit-exact restoration must be.
+
+Strength statement: 1.4.21 plays at v1.4.16 strength. The 3274 ± 21
+CCRL-Blitz measurement transfers (identical engine + identical net;
+only the version string differs). The "250-300 Elo on top of 1.4.16"
+from §55-§57 never existed — corrected, those rounds were -7.4 / -93 /
+-172 / -31.8. The honest restart point is 3274.
+
+**Harness fixes shipped with 1.4.21 (so this cannot recur):**
+1. match.py SIGN FIX: progress/SPRT/FINAL lines now compute Elo and LLR
+   from the CANDIDATE's perspective (B-vs-A) and print the raw A-POV
+   W-D-L alongside ("W-D-L(A) 6-1-23 cand-elo(B-A) +223.3"). The old
+   output for that exact match read "elo +223.3" with the same W-D-L —
+   indistinguishable from a candidate gain. Resume-compatible (the
+   stored games[] A-POV format is unchanged).
+2. scripts/training/validate_net.py — a mandatory pre-ship net gate:
+   probes a DIVERSE position suite via evalpos on champion vs candidate
+   and FAILS on residual-sd collapse below 50% of the champion's (the
+   1.4.20 net reads 9%) or |mean drift| > 15 cp (it reads +15.2), and
+   detects engine drift via HCE mismatch. The 1.4.20 binary fails this
+   gate; the 1.4.21 binary passes with ratio 1.000.
+3. reanchor_shrink.py GUARD: sfrac < 0.40 now refuses to run without
+   --force, with a pointer to §58.
+
+**Lessons (additions to §3):**
+- A gate harness must state whose Elo it is printing, in the line
+  itself. "elo +93.2" with W-D-L 149-68-73 should never have been
+  readable as a candidate gain.
+- Correct-read recompute is cheap: recomputing the stored gate JSONs
+  took minutes and reversed the entire narrative of three release
+  rounds. Store raw results; re-derive every summary from them.
+- A residual net whose sd collapses an order of magnitude below its
+  champion is not "a quieter eval operating point", it is a deleted
+  eval. validate_net.py exists because "the games said so" was itself
+  the corrupted signal.
+- External (out-of-family) verification is not optional garnish: it is
+  the only signal that survived this incident uncorrupted. The 900-game
+  CCRL-replica that produced 2822 was the single correct measurement in
+  the entire 1.4.17-1.4.20 chain.
+
+**Composition: 1.4.21 = the 1.4.20 engine tree (unchanged) + nnue_net.cpp
+restored to net v99-ftd10-ha-b400 (extracted bit-exact from the shipped
+1.4.16 host binary) + version bumps (api.cpp "TacTurn 1.4.21",
+versionCode 58) + binaries/tacturn-1.4.21-linux-x64 (host build, bench
+d9 = 180,736 = the 1.4.16 champion fingerprint) + scripts/training/
+extract_net.py (the ELF net extractor) + scripts/training/validate_net.py
+(the pre-ship net gate) + the reanchor_shrink.py guard + the match.py
+sign fix + this section.**
+
+
+## 59. 1.4.22 — the post-incident audit of §49–§57 (an independent python-chess referee re-gates the whole era; the v96pre restoration ships)
+
+Mission: §49–§57 gains were gated through the sign-inverted harness
+(§58), so every claim in that range was unverified. This round audited
+the era with an INDEPENDENT referee — nothing from the repo's gate path
+was trusted — and shipped whatever survived.
+
+**The referee (scripts/host-tools/referee.py + gate.py):**
+
+A fresh python-chess match runner: persistent engine processes, 46
+paired openings (each opening played with both colors), fixed movetime
+(`go movetime`), and ALL adjudication by python-chess — legality of
+every bestmove, mate, stalemate, insufficient material,
+threefold/fivefold, 50/75-move, ply-cap draws; illegal move, timeout or
+crash = loss for the offender. SPRT(0,10) with logistic LLR, bounds
+±2.9444, alpha=beta=0.05. Contract: A = CANDIDATE always; reported Elo
+is A-POV. Append-only JSONL logs, resumable across the host's process
+reaping.
+
+Verified before use, per protocol:
+* **identity/zero test** — the same binary on both sides: n=738,
+  249-239-250, **−0.5 ± 12.8** (0 within noise, no side bias);
+* **delta self-test** — a known-different binary pair: +320.7 ± 40.8,
+  LLR +3.17, H1 at n=154 (fast, correct accept);
+* SPRT/elo math Monte-Carlo selftest (400 trials × 5 true elos):
+  elo 0 → 97% H0, +30 → ~100% H1, mean n in the expected band.
+
+**What the binaries actually are (identity map, bench + evalpos):**
+
+| version | nnue-off d9 bench | net @ startpos | net |
+|---|---|---|---|
+| 1.4.8–1.4.11 | 254,976 → 263,168 @1.4.10 | nnue −12 | **v96pre** |
+| 1.4.12 | 263,168 | −58 | v96dnav4 |
+| 1.4.13 | 263,168 | −60 | v97b |
+| 1.4.14/15 | 263,168 | −52 | v98 |
+| 1.4.16 | 263,168 | −59 | v99 |
+| 1.4.17–1.4.20 | 263,168 | −62 … | v100 → v113 |
+
+Search code last changed at 1.4.10 (§47); 1.4.11–1.4.20 are
+tree-identical (bench 263,168 with NNUE off). So the §49–§53 rounds
+were pure net swaps — each auditable by swapping extracted nets into
+the ONE code base, and the §46/§47 code levers auditable across
+1.4.8 → 1.4.10 with the net constant. All nets were re-extracted
+bit-exact from the shipped binaries (extract_net.py, §58).
+
+**The audit gates (referee, SPRT(0,10), 30 ms + 60 ms fixed movetime):**
+
+| gate | A (candidate) vs B | 30 ms | 60 ms | delta 30→60 | verdict |
+|---|---|---|---|---|---|
+| A0 zero | same binary | −0.5 ± 12.8 (n=738) | — | — | referee sane |
+| A2 delta | known-diff pair | +320.7 ± 40.8, H1 (n=154) | — | — | referee sane |
+| **B1** | **v96pre net vs v99 net** (1.4.11-net vs 1.4.16/1.4.21-net, same code) | **+74.5 ± 12.6 pooled, LLR +3.08 H1** (n=606) | **+74.8 ± 15.7, LLR +2.99 H1** (n=514) | **stable (+75 → +75)** | **ACCEPT — genuine lever** |
+| B2 | v96dnav4 net vs v96pre net (§49's "champion" net) | −57.7 ± 14.4, LLR −3.02 **H0** (n=602) | −40.9 ± 16.6, LLR −1.62 (n=444) | shrinks, negative at both | REJECT — §49's "+81.5" was a masked −58 |
+| C1 | 1.4.10 code vs 1.4.8 code (§46+§47 levers, v96pre net held) | −20.6 ± 13.4, LLR −1.34 (n=676) | — | — | INCONCLUSIVE — flagged suspect, not reverted (see below) |
+
+**External transfer check (out-of-family — the only signal class that
+survived §58 uncorrupted; Simbelmyne 1.10.0, same rig, 5+0.05, the
+PGN's own book exits):**
+
+| build | score vs Simbelmyne | Elo |
+|---|---|---|
+| 1.4.20 (v113 net) | 35.0% (n=30) | −108 |
+| 1.4.16 / 1.4.21 (v99 net) | 63.3% / 60.0% → 61.7% pooled (n=60) | +78 |
+| **1.4.22 (v96pre net)** | **68.8% (n=120)** | **+137 ± 29** |
+
+The B1 self-play gain (+75) transfers externally (+59 vs the v99
+family on identical conditions). The referee ordering also reproduces
+the §58 forensics: the stored-gate recompute says v99 ≈ −80 vs v96pre
+in-family, matching B1's −75 within noise.
+
+**Decision — what ships and why:**
+
+* **B1 ships**: formal SPRT(0,10) H1 at BOTH controls with a stable
+  delta, plus external transfer in the same direction. This is the
+  strongest evidence class this host can produce. **1.4.22 = the
+  1.4.20/1.4.21 engine tree with nnue_net.cpp restored to v96pre**
+  (extracted bit-exact from the shipped 1.4.11 binary). Proof of
+  correctness: the 1.4.22 host build reproduces shipped 1.4.11's full
+  bench, line for line, with NNUE on (bit-exact net + tree-identical
+  code ⇒ bit-exact play); perft exact (startpos d5 = 4,865,609).
+* **B2 rejected with measurement**: the §49 anchored-head retrain was
+  a −58 regression mislabeled +81.5 by the inverted gate. dnav4 (and
+  by the stored-gate recompute, v97b and v98 after it) never beat
+  v96pre in-family.
+* **C1 flagged, not reverted**: the §46/§47 code levers read −20.6 ±
+  13.4 (1.5σ negative, LLR −1.34) — their claimed "+8.6" does not
+  reproduce, but the evidence is below the H0 line. Reverting would
+  require pre-1.4.8 source that is not in this repo, and the levers
+  are shared by the CCRL-verified 1.4.16 baseline, so they are
+  DOCUMENTED AS SUSPECT and left for a dedicated revert-gate round.
+* **The open question, stated honestly**: the historical external
+  ladder (1.4.10 → 3157 @ 3+2/15-concurrent, 1.4.12 → 3248 @ 119+1,
+  1.4.16 → 3274 @ 40/2) rises across the same rounds this audit says
+  fell in-family. Those three numbers came from three different
+  controls, books and concurrency setups and never directly played
+  each other; this audit's head-to-heads (same rig, same opponent,
+  same clock, n=120) are the only same-condition external comparisons
+  in existence and they side with v96pre. The arbiter is the 900-game
+  CCRL replica: **expected 1.4.22 ≈ 3270–3340 if the 1.4.16 anchor
+  transfers; run it before any further net round.**
+
+**Lessons of the audit round:**
+
+- The referee contract (A = candidate, Elo = A-POV, zero test first)
+  makes sign errors structurally impossible: a flipped convention now
+  flips the ZERO test too, so it cannot silently pass.
+- An era gated by a broken harness is not "probably fine where it
+  agreed with itself" — every claim in the era must be re-measured
+  from raw artifacts (binaries + stored game logs), not re-trusted.
+- Bit-exactness is the cheapest possible proof at every step: nets
+  extracted from binaries, binaries proven against benches, benches
+  proven against HISTORY fingerprints. Nothing in this audit required
+  trusting any intermediate summary.
+
+**Composition: 1.4.22 = the 1.4.21 tree (engine code unchanged — bench
+263,168 nnue-off, tree-identical since 1.4.10) + nnue_net.cpp = net
+v96pre (bit-exact from shipped 1.4.11) + version bump (api.cpp
+"TacTurn 1.4.22", versionCode 59) + binaries/tacturn-1.4.22-linux-x64
+(host -O3 -flto -march=native build; bench bit-exact vs shipped
+1.4.11 with the net on) + scripts/host-tools/referee.py and gate.py
+(the independent referee) + this section.**
+
+## 60. the 1.4.23 round that was run to a clean rejection — Lc0 data at natural scale on v96pre, formally falsified at both TCs (no ship; 1.4.22 remains champion)
+
+Mission: execute the post-audit plan literally. §59's corrected reading of
+§56 claimed the natural-scale (s=1.0) trained Lc0 nets had been +34.9 true
+Elo, discarded by the sign-broken gate in favor of catastrophic shrinks;
+therefore: retrain on fresh robotmoon Lc0 binpack data with the verified
+referee, trust the natural scale, never shrink, and gate SPRT(0,10) at
+30 ms and 60 ms against the v96pre champion (1.4.22). Every step of that
+plan was executed. The hypothesis was then formally falsified by its own
+gates. This section is the record of a round whose correct outcome is a
+rejection — the first round in the project's history to close without a
+ship, and the first whose every reading can be trusted.
+
+**Data (10M fresh positions, three-month prefix chunks):** HTTP-Range +
+partial-zstd prefixes of test80-2024-01/02/03 (33.5+33.5+50.3 MB
+compressed), decoded and deduped to eligible-position TSVs, then labeled
+with the champion's own HCE via the new `evalbatch` UCI bulk path (~50x
+faster than per-FEN evalpos round-trips — added this round). Corpus:
+**10,000,000 positions** with per-position HCE, Lc0 score, and 16 output
+buckets. HOME anchor re-pinned on a 60k-position sample of the champion's
+own book-exit self-play pool (raw_home/datagen-*).
+
+**Targets (this round's construction):** per-bucket CENTERED and
+CHAMPION-SCALED — t_cp = ((clip(sf-hce, ±600) - mu_d[b]) / sd_d[b]) *
+s_ch[b] + m_ch[b]. The §55 a*-trap cannot recur (no regression-slope
+division anywhere); the warm-init net sits at the correct operating point
+from step 0 and all gradient goes to shape. Corpus target stats: mean
++22.7 cp, sd 90.0 cp vs the champion's own residual mean +20.9 / sd 82.2.
+
+**Training:** the §53 FT-unfreeze trainer (FT_W/FT_B + full head, FT_MULT
+0.1, Adam per-tensor scales, cosine LR 1.2e-3, huber delta 150), one epoch
+= 2438 batches x 4096 on fresh positions only, warm-init from the v96pre
+integers, chunk-resumable across the 600 s tool boundary (~2.9 h wall).
+Val-corr ladder (champion's own val-corr on this corpus: **0.3710**):
+
+| snapshot | b300 | b600 | b900 | b1200 | b1500 | b1800 | b2100 | b2400 |
+|---|---|---|---|---|---|---|---|---|
+| val-corr | 0.439 | 0.458 | 0.469 | 0.4769 | 0.4806 | 0.4826 | 0.4834 | 0.4836 |
+
+**Toolchain proofs (all on the shipped-integer candidates):** exporter
+round-trip bit-exact on every snapshot (cap-clips: FT_W 5841/1.57M =
+0.37%, W2 150/524K, W3 11/16K, W4 14/512 — the documented caps W1<880
+W2<400 W3<12000 W4<8192 preserve the engine's audited int32 dot margins);
+fuzznnue 6,122,405 positions / 0 mismatches (b1200 and b2400 — the
+accumulator-delta proof that matters when the FT itself moves);
+engine-vs-numpy bit-exact 298/298 on the bench suite and 300/300 on the
+HOME sample (validates the blend=77 round-half-away semantics of the
+`evalpos` residual field); perft 5 = 4,865,609 exact; HOME anchor
+verified post-quantization: per-bucket mean within ±0.7 cp and sd-ratio
+0.993–1.002 of the champion on every candidate. Bench fingerprints
+(champion 171,520): b300 179,712 / b600 178,176 / b1200 197,632 /
+b1800 215,040 / b2400 226,816 — monotone tree drift with training depth,
++32% at the full epoch.
+
+**Gates (independent python-chess referee, paired color-swapped
+openings, SPRT(0,10), A = candidate, champion = 1.4.22):**
+
+| gate | TC | games | W-D-L | elo | verdict |
+|---|---|---|---|---|---|
+| sprt30_r4b600 (primary) | 30 ms | 1072 | 329-321-422 | **-30.2 ± 10.7** | **H0 REJECTED** |
+| sprt60_r4b600 (primary) | 60 ms | 768 | 224-224-320 | **-43.7 ± 12.6** | **H0 REJECTED** |
+| sprt30_r4b2400 (final net) | 30 ms | 718 | 212-199-307 | **-46.2 ± 13.1** | **H0 REJECTED** |
+| sprt60_r4b2400 (final net) | 60 ms | 708 | 197-218-293 | **-47.4 ± 13.2** | **H0 REJECTED** |
+| sprt30_r4b300 (ladder point) | 30 ms | 254 | 73-68-113 | -55.2 ± 22.1 | LLR -1.23 informal |
+| scr30_r4b600s050 (exposure) | 30 ms | 226 | 39-44-143 | **-172.9 ± 26.0** | **H0 REJECTED** |
+| scr30_r4b600s125 (exposure) | 30 ms | 504 | 145-165-194 | -33.9 ± 15.5 | screen |
+
+Every LLR path descended monotonically to its verdict — no first-chunk
+spikes anywhere, so the anti-spike ship condition is moot rather than
+failed. The 60 ms penalty exceeds the 30 ms penalty on both candidates:
+deeper search exploits the mispricing more, the mirror image of the
+§53-era depth-strengthening pattern for genuinely better evals.
+
+**The exposure axis under true signs (the §55/§56 story, finally
+measured with a referee that cannot lie):** on b600 at 30 ms, s=0.50
+loses -172.9, s=1.00 loses -30.2, s=1.25 loses -33.9. The curve is
+monotone up to s≈1.0 with a plateau past it — the same shape as §56's
+ladder after sign correction (s=1.0 best, every shrink worse). Two
+conclusions fall out. First: the exposure shrink that defined the
+§56/§57 shipping decisions is confirmed catastrophic, now on a second
+net family with the verified referee. Second: no exposure rescues this
+direction — an amplified wrong direction is still a wrong direction.
+
+**Why the round rejected (the finding):** the champion's own residual
+matches this corpus's Lc0 direction at corr 0.371; the training moved
+the net to 0.484 at the cost of -30 to -55 Elo in play, at every
+training amount measured (b300/b600/b2400 are statistically level once
+sigma is respected). Teacher-match and play-strength came apart
+completely: +0.11 val-corr was bought with a third of a bishop. The
+composite TacTurn eval is HCE + 0.77 x residual; v96pre's residual is
+not an approximation of Lc0's opinion, and replacing it with a genuine
+Lc0 approximation makes the engine weaker at every time control
+measured. The §59-corrected "+34.9 natural scale" reading belonged to
+the v110 lineage — a base ~74 Elo weaker than v96pre (§59 B1) — where
+Lc0 distillation plausibly still had headroom. On the stronger base the
+headroom is gone: distillation gains do not transfer to bases that are
+already better than their teacher's reachable composite.
+
+**Lessons of the rejection round:**
+
+- The sign fix was necessary but not sufficient: it converted
+  "the readings are odd, keep shrinking" into a clean falsification in
+  ~90 minutes of gates. The referee's job is not to make the hypothesis
+  pass; it is to make the hypothesis testable. This round is what a
+  working gate looks like when the answer is no.
+- A val-metric ladder (corr 0.371 → 0.484, monotone, held-out) said
+  "better" while every SPRT said "worse". Eval-quality metrics that do
+  not share the engine's composite structure (HCE + blend + search
+  scaffold) are not shippable evidence — only the games are.
+- The strongest available net (v96pre) was found by AUDIT, not by
+  training: three training eras (§49-§57) and this round all failed to
+  beat it. The rational prior for future net rounds on this architecture
+  is that v96pre is near the ceiling for this corpus family, and the
+  productive axes are search-side levers or a new architecture.
+
+**Composition: NO SHIP. 1.4.22 (v96pre) remains the champion and the
+last release. Artifacts preserved under work/round/: nets/delta_ft22_*
+(the eight snapshots + exposure variants), scripts/ (corpus_build22,
+feats22, home_stats22, train_ft22, write_net22, reanchor_expose,
+validate_engine22, home_cmp22, champ_val_corr, snap_eval), bin/
+(champion + all candidates, all bit-exact-proven), and the gate records
+copied to gaterecords/. The 5.6 GB corpus intermediates were pruned
+after the round (regenerable from the robotmoon sources); the corpus
+itself (train_corpus22.npz), feature tables, and HOME sample are kept.
+Queued next: the external CCRL replica of 1.4.22 (§59's arbiter —
+expected ≈ 3270-3340), and — only if another net round is opened — the
+SF-family teacher axis on v96pre (never tested on this base), with this
+round's protocol as the template and this round's outcome as the prior.**
+
+## 61. 1.4.23 — the C1 revert ships: the sign-flipped-era search levers reverted, externally confirmed (+13.9/30ms, +18.7/60ms in-family; Δ+21.1 external vs Simbelmyne)
+
+(Numbering note: §60's heading calls its rejected Lc0 round "the 1.4.23
+round" because that was the number it would have taken; it shipped
+nothing, so the number was never consumed. This section is the actual
+1.4.23 — the first release after 1.4.22.)
+
+Mission: close §59's one open flag. The C1 re-read had measured the
+§46/§47 lever pack (v1.4.9 TT-bound-aware quiet LMR + v1.4.10
+continuation corrhist + v1.4.10 single-reply extension) at
+−20.6 ± 13.4 pooled with the fixed-sign referee — a 1.5σ negative
+reading against a claimed "+8.6", below the H0 line but documented as
+suspect and left "for a dedicated revert-gate round". This is that
+round, and it resolves the flag in the direction the audit pointed.
+
+**The candidate (r47):** the 1.4.22 champion tree with exactly the three
+suspect levers reverted — continuation corrhist reads and writes removed
+(the table stays allocated and zero), the hoisted ttValLmr computation
+and its r++ application removed, and the single-reply extension's
+detection block plus both childDepth application sites removed. Nothing
+else touched; the net is v96pre unchanged. The v1.4.4 evasionMask
+computation stays (the provably-illegal in-check skip still uses it).
+Bench: 188,416 net-on (champion: 171,520), 254,976 net-off (champion:
+263,168) — the reverted levers were costing 3.1% of tree speed on
+top of their measured Elo damage.
+
+**In-family gates (verified referee, SPRT(0,10)):**
+
+| control | result | verdict |
+|---|---|---|
+| 30 ms | +13.9 ± 5.9, LLR +3.04 (n=3458; 1189-1218-1051) | H1 |
+| 60 ms | +18.7 ± 7.2, LLR +2.97 (n=2328; 821-811-696) | H1 |
+
+**The external-transfer campaign — and the second harness bug of the
+era.** The B1 ship bar requires out-of-family confirmation, so both the
+candidate and the champion played Simbelmyne 1.10.0 on the same rig
+(movetime 30, the 46-opening book, paired colors). The first legs (r47
+n=1208, champ n=930) produced a suspicious reading — and the right call
+was made: stop, audit the games, not the Elo. The audit found ~8% of
+games decided by reason="parse": **Simbelmyne 1.10.0 emits promotion
+moves with an UPPERCASE suffix ("b7b8Q")**, python-chess rejects them,
+and the referee forfeited Simbelmyne on every promotion. TacTurn itself
+outputs lowercase (0 parse failures in 5,786 in-family games), so both
+legs were inflated by fake forfeits (r47 +301.6, champ +311.0 — both
+~90 Elo above their true level) and the Δ was contaminated by a 0.9%
+forfeit-rate difference between legs. Fix: case normalization in the
+referee's bestmove parser (a promotion suffix in QRBN is lowercased
+before parsing; unit-probed against Simbelmyne's actual output and
+end-to-end tested). The corrupted logs are quarantined under
+work/audit/games_corrupt_promo/ — they are the era's second lesson that
+game logs, not summary numbers, are the only auditable artifact.
+
+**The clean rerun, pre-registered.** Before any clean data existed, the
+decision rule was written down (work/audit/ship_rule_r47.md, carried in
+the release package): fixed-n to a 2400-games/leg cap, PASS ⟺ Δ̂ ≥ −10
+AND the one-sided 95% lower bound of Δ̂ excludes −20 (the size of a
+regression that would cancel the in-family gain). Mid-experiment, two
+rule events, both disclosed in the document itself: (1) an amendment
+requiring σ_Δ ≤ 15 before any PASS (conservative-only — it can delay or
+refuse, never create, a pass); (2) an ERRATUM: the bound formula as
+originally written had the wrong sign (Δ̂ + 1.645σ — an upper bound,
+vacuous for this test; Amendment 1 had noticed the vacuity and
+misdiagnosed it as low n). With the corrected lower bound both interim
+readings still passed, but the margin was thin and Δ̂ was drifting, so
+the decision was deferred to the pre-registered cap. No further rule
+changes.
+
+**Final clean external numbers (0 anomalies — no parse/illegal/nomove/
+timeout games — in all 4,800 games):**
+
+| build | vs Simbelmyne 1.10.0 | Elo |
+|---|---|---|
+| 1.4.23 (r47) | 1696-389-315 (n=2400, 70.6%) | +227.8 ± 8.7 |
+| 1.4.22 (champion) | 1626-428-346 (n=2400, 68.0%) | +206.7 ± 8.4 |
+| **transfer Δ (r47 − champ)** | | **+21.1 ± 12.1, one-sided 95% lower +1.3** |
+
+The external CI excludes not just −20 but zero: the revert's gain
+transfers out-of-family at full strength, in a regime where the §58/§59
+artifacts (sign flips, harness lies) all showed up externally as
+negative deltas. Both B1 bar conditions hold: formal SPRT(0,10) H1 at
+both controls, external transfer in the same direction.
+
+**Ship. 1.4.23 = the 1.4.22 tree + the search.cpp revert + version bump
+(api.cpp "TacTurn 1.4.23", versionCode 60).** Proof chain: the release
+binary's default bench is 188,416 and its bench-16 output is
+line-for-line identical to the gate binary that played all 10,178 gate
+games; the package's own engine sources rebuild to the same 188,416;
+perft exact (startpos d5 = 4,865,609); net v96pre bit-exact unchanged
+(nnue_net.cpp untouched this round).
+
+**Lessons of the revert round:**
+
+- The C1 suspicion was real, and the resolution is the template for
+  every "flagged, not reverted" audit finding: a 1.5σ negative reading
+  of a sign-flipped-era claim became, when actually reverted and gated,
+  a clean double-H1 with external confirmation. Era levers that only
+  ever passed under a broken gate do not survive re-measurement.
+- A referee must normalize the move-encoding dialect of its engines
+  (case of promotion suffixes) before adjudicating; an opponent's
+  formatting quirk is a legality question for the adapter, never a
+  forfeit for the game. The tell was in the logs the whole time —
+  reason="parse" at 8% with every note an uppercase promotion.
+- Pre-registration is what made the mid-experiment fixes survivable:
+  the conservative-only amendment and the sign erratum are documented
+  in the rule file with the readings that motivated them, and the
+  decision was taken at the pre-registered cap, not at a lucky interim
+  peak. The interim sequence (+37, +24, +29, +18, +8, +10, +10, +11,
+  +5, +11, +15, +22, +21) wandered exactly as a ±12-noise process
+  should; only the final σ-resolved reading carries the decision.
+- Reverting code buys speed back: the champion's tree spent 3.1% of its
+  nodes maintaining three tables and detection loops whose measured
+  contribution was negative.
+
+**Composition: 1.4.23 ships (engine tree: search.cpp revert, api.cpp
+version bump; app versionCode 60; binaries/tacturn-1.4.23-linux-x64 —
+bench 188,416 net-on / 254,976 net-off, perft d5 exact, line-identical
+bench-16 vs the gate binary; scripts/host-tools carries the fixed
+referee.py, the xlegs.py dual-leg runner and the ship-rule document with
+its amendment and erratum). Gate records preserved under work/audit/
+(a_r47_30, a_r47_60, x_r47_smb, x_champ_smb; corrupted first legs under
+games_corrupt_promo/). Net v96pre unchanged — the §60 conclusion stands.
+Queued next: the search/tuning lever campaign on the 1.4.23 base (the
+C1 template: ranked candidates, verified referee, both TCs), and the
+SF-teacher relabel axis (Stockfish 17.1 now installed as the teacher)
+with §60's protocol and outcome as the prior.**
+
+## 62. 1.4.24 — the externally-audited lever pack (bit-exact L1–L7 speed + S1–S3 search + the §49–§60 training-pipeline fix)
+
+An external review proposed a full ranked claim list against the 1.4.23
+tree. Every claim was verified against the actual source before
+implementation; all confirmed defects are fixed in this release.
+
+**L-pack (bit-exact speed, zero tree change):**
+- L1: argMaxScores had TACTURN_AVX2 defined but unused — only AVX-512 had
+  a kernel. AVX2 and NEON two-pass first-index-of-max kernels added.
+- L2: on AVX2 the act3 spill (four 128-bit stores reloaded by two 256-bit
+  dotI16 loads) was a guaranteed STLF stall per NNUE inference — the
+  v1.4.7 dotBlock16Ret fusion had only been done on AVX-512. Fused
+  dotL3W4Avx2 + paired 256-bit act2 stores. On NEON the v1.4.7 update had
+  never been done at all: scalar clipI_ tail (32 branchy calls + 32
+  two-byte stores reloaded by the next layer), branchy 512-iteration
+  zero-pair walk. Now clipBiasNzNeon + dotBlocks4PairMajorNz +
+  dotL3W4Neon + clipStoreTailNeon — the AVX2 design mirrored.
+- L3: accFusedRows specialized/unrolled for (1,1) quiets and (2,1)
+  captures (all SIMD variants + scalar).
+- L4: quiesce's quietChecksLeft was never decremented when a checking
+  quiet/castle was popped, so the break never fired after the last check.
+- L5: duplicate seeGE on proven-good captures skipped; givesCheckQuiet
+  moved behind the integer prune gates.
+- L6: evaluateImpl<bool Trace> (zero runtime tuner branches in play),
+  king-danger scans gated on their consuming attacker condition, ten
+  piece counts hoisted to five use sites.
+- L7: dead corrCont (576 KB/worker) + corrContBase removed;
+  historiesZeroed latch skips the redundant move-1 prepareAge sweep;
+  pgo-host.sh gains -flto -fno-plt.
+
+Fingerprints: bench 9/12/13/14 = 188,416 / 741,376 / 1,149,952 /
+2,076,160 (identical to 1.4.23); bench 9 line-for-line identical; perft
+d5/d6 exact; fuzzGivesCheck/fuzzSee/fuzznnue 0 mismatches. Speed on the
+AVX2 (x86-64-v3) target: +6.4% NPS at identical tree; +26.4% per-node
+with LTO+PGO (fixed pipeline), fixed-depth bench-14 wall clock −28.3%.
+NEON kernels executed through SIMDe on x86 against the portable
+reference: 400 vectors / 16 buckets / 122k nonzero pairs / 0 mismatches
+(new scripts/host-tools/run_neon_simde_test.sh).
+
+**S-pack (search):**
+- S1: evalCache kept warm across ucinewgame (pure function of pos->key;
+  pawnHash already was).
+- S2: LMR-reduced scouts pass cutNode=true (expected Cut-node child);
+  unreduced scouts and verifications unchanged.
+- S3: updateCutoffStats statDepth = depth + (bestScore > beta+100 &&
+  depth < 12) at both call sites.
+
+bench 14: 2,076,160 -> 1,881,088 (−9.4% tree at equal depth).
+
+**In-family gate (python-chess referee, 30 ms/move, 2 workers,
+A = 1.4.24 same-flags vs 1.4.23):** n=1146, 406-385-355 = **+15.5 ± 10.3
+Elo (53.2%)**, LLR +1.15 (SPRT(0,10) not formally resolved at the cap;
+point estimate 1.5σ from zero), zero adjudication anomalies. Shipping
+config (L-pack + LTO+PGO) vs 1.4.23 plain: n=208, 88-72-48 = +67.7 ±
+24.5, zero anomalies.
+
+**N1 (training pipeline, the §49–§60 forensic fix):** the four compounding
+defects are fixed in scripts/training/ — static-eval labeling with POV
+calibration (label.py; ~1000x faster), OLS a* + the §13–§28 target
+formula (filter_scale.py, both trainers), anchor_apply deleted + B4
+frozen (variance inflation was multiplying prediction noise by 1/r),
+FT_MULT 0.10 -> 0.0025. Full protocol: scripts/training/README-TRAINING-FIX.md.
+No new net ships; the validate_net + referee + external gates are
+mandatory for any candidate.
+
+**Composition: 1.4.24 ships (engine tree: search.cpp, nnue.cpp, nnue.h,
+evaluate.cpp, api.cpp; app versionCode 61; binaries/ carries the native,
+x86-64-v3 and PGO host builds — all bench-verified; scripts/host-tools
+gains run_neon_simde_test.sh). Net v96pre unchanged.**
+
+---
+
+## 63. 1.4.26 — the third-pass audit: singular-extension bug cluster, bit-exact NNUE speed pack v2, and time-management fixes (S1+S2+B1–B4+T2+T3)
+
+An external audit of the 1.4.25 tree proposed a ranked claim list. Every
+claim was re-verified against the actual source first; the audit's
+diagnoses were confirmed (its line-level citations all resolve), but its
+"drop-in patches" did not — several reference structures that do not
+exist in this codebase, and the AVX2 index-compress construction in its
+Patch 2 is incorrect as published (pshufb selector bytes pick wrong base
+bytes). Everything below was re-engineered against the real kernels.
+
+**S1 (search, tree change):** the four interlocking singular-extension
+defects — (1A) the SE block ran before razoring/RFP/NMP/ProbCut although
+its flags are only read in the move loop (wasted excluded searches on
+nodes that pruned before any move); (1B) Razoring and RFP lacked the
+`excludedMove == MOVE_NONE` guard every other pre-loop gate has, so SE
+verifications (seDepth ≤ 8 whenever depth ≤ 17) short-circuited at their
+own root — razoring dropped the *excluded* search into a quiescence that
+searched ttMove itself, RFP returned `evalPrune ≥ singularBeta` without
+testing any alternative (the v1.1.0 multi-cut −41 mechanism); (1C) the
+excluded search recomputed the static eval its caller already held at
+the same ply/board/corrhist state — now reused via evalStack[ply];
+(1D) a mate-range TT bound could overwrite evalPrune and let RFP return
+an unproven mate score. The block is relocated to just before the move
+loop (the Stockfish position). **Tree: bench 9 196,608 → 179,712 (−8.6%),
+bench 14 1,881,088 → 1,601,024 (−14.9%) — the audit's numbers exactly.**
+
+**S2 (search, abort hygiene):** `!stopped()` guards on the LMR
+re-search history feedback and the PVS re-search — the hard-deadline
+`score = 0` unwind used to corrupt all 8 history tables
+(±depth²/2 decided by `0 > alpha`) and launch a post-timeout recursive
+search whenever `alpha < 0 < beta`. Inert at fixed depth.
+
+**B-Pack v2 (bit-exact speed):** bench 9–17 node-for-node identical to
+1.4.25 after the fix below. (B1) nzPairs compression on both SIMD paths —
+the nonzero activation-pair VALUES are mask-compressed in parallel with
+the indices, the sparse L2 kernels broadcast from the sequential stream
+instead of the data-dependent `A + 2*nzIdx[k]` gather, the 2 KB A array
+is never materialized, and the AVX2 ctz walk is replaced by a 256×8
+branchless vpermd LUT. (B2) `alignas(64)` Accumulator/FinnyEntry
+(offsetof(nnueRing) was 212 ≡ 20 mod 64). (B3) dirty-ancestor
+back-healing in nnueEnsureFresh: after a replay walk repairs slot cur,
+the intermediate slots stay dirty and every sibling visit re-pays
+refreshPerspective for the same king crossing; the new backward walk
+applies the recorded ops in reverse (exact modular-int16 inverse,
+`nnue::healMoveAcc`), stopping each perspective at its OWN king-bucket
+crossing — a crossing re-keys that perspective's whole feature space and
+cannot be row-reversed. **This crossing subtlety was missed by the
+audit's sketch: the first implementation healed straight through the
+crossing and bench 14/15 diverged (position 3, ±512 nodes); the
+instrumented accumulator-vs-from-scratch harness pinned every returned
+value as exact, and a component bisection isolated the heal, then the
+crossing rule. refreshPerspective calls on bench 14: 29,086 → 15,762
+(−45.8%), node counts identical.** (B4) depth≤0 quiesce handoff above
+the redundant preamble (draw adjudication stays ABOVE the handoff —
+below it, depth≤0 draw nodes would double-count in checkStop and shift
+the bench fingerprint; also found by bench-14/15 bisection), hoisted
+per-node quiet-history rows (QuietHistRows) shared across the prunes /
+LMR / updateCutoffStats, 32-bit gravity (bounds audited, 64-bit
+fallback), O(1) hanging-piece partition (popcount classes + residual
+loop; TADD linear). Measured NPS on this 2-core AVX-512-VNNI host:
++1.0–1.2% at the identical tree — the audit's +12.3–13.8% was an
+AVX2-only host where the branchy walk it removed dominates; on AVX-512
+the compress path was already branchless.
+
+**T2 (time):** `go movetime` runs to the budget's end (the estMs =
+1.3×lastIterMs gate discarded 23–31% of every 30–50 ms budget —
+unspent movetime cannot be banked; the hard wall every 512 nodes +
+the partial-iteration salvage handle the overshoot). **T3 (time):**
+lastScore 0-default phantom — timeman's cross-move falling-eval test
+treated the unset 0 as history and permanently forced unstable_ in
+clocked play below −30 cp; sentinel default + real-score guard + the
+harness now tracks the true per-side previous score.
+
+**In-family verification (python-chess referee, paired openings,
+single-threaded, A = 1.4.26 vs shipped 1.4.25):** fixed movetime 50 ms,
+n=350: 155-113-82 = **+73.5 ± 19.0 (z = +3.87)**; fixed movetime 25 ms,
+n=200: 70-62-68 = +3.5 ± 24.6; pooled 25+50 ms, n=550: 225-175-150 =
+**+47.7 ± 15.0 (z = +3.19)**; pooled all TCs (15/25/50 ms), n=650:
+255-208-187 = +36.5 ± 13.7. Fixed movetime 15 ms, n=100: 30-33-37 =
+−24.4 ± 34.8 (at ultra-short budgets T2's upside collapses — isolated
+T2-only: −13.9 ± 34.8 @ 15 ms but **+88.7 ± 46.3 @ 50 ms**; the audit's
+own benchmark TCs for T2 were 30–50 ms). Component runs @ 15 ms (all
+n=100): S1-only +20.9 ± 34.8; full-stack-no-T2 −3.5 ± 34.7 — every 15 ms
+decomposition sits inside ±35 error bars, i.e. nothing at 15 ms resolves
+below noise; the gains concentrate at practical budgets and grow with
+movetime, exactly the T2 utilization signature. Fuzz batteries on the release binary (stdin protocol): fuzznnue
+410,536 positions / 0 mismatches (incremental == from-scratch AND
+quantized int == double reference at every position); fuzzsee 406,798
+positions / 5,843,090 threshold checks / 0 mismatches; fuzzcheck
+(givesCheckQuiet) 309,084 positions / 6,679,458 quiet moves / 0
+mismatches. Not taken: the
+audit's NNUE retraining section (no labeled shards ship in the repo;
+any net change would also invalidate the bit-exact B-Pack chain), and
+the two remaining training-script inconsistencies (r3_train.py /
+train_ft_lc0.py FT_MULT/Adam indexing — engine-side unaffected).
+
+**Composition: 1.4.26 ships (engine tree: search.cpp, search.h, nnue.cpp,
+nnue.h, position.cpp, evaluate.cpp, timeman.h, api.cpp; harness:
+scripts/host-tools/uci.cpp; app versionCode 62 / versionName 1.4.26;
+binaries/tacturn-1.4.26-linux-x64. Net v96pre unchanged.)**
+
+## v1.4.27 — the ultra2 tier (2026-11-01)
+
+N1 Fail-Soft Singular Multi-Cut (post-S1: the v1.1.0 disqualifier is
+gone; excludedScore >= beta at non-PV nodes returns immediately — bench
+9 −6.3%, bench 14 −4.3%, best moves identical). N2 raw-residual caching
++ quiescence TT-hit leaf-blend consistency (kills the r*100/bp
+double-rounding in every static eval; the v1.4.3 "−40" rejection was a
+sign-flipped-era artifact). N3 STLF-free AVX2 forward pass (aligned
+dense dstPairs, uint16 idx16 LUT, pre-biased accumulators). N4 ARM64
+NEON parity (branchless LUT append, uint16 index list, pre-biased
+dual-bank accumulators — SIMDe-executed proof, 122,126 nonzero pairs /
+0 mismatches). N6 single-pass Finny refresh (dual-write accFusedRows)
++ null-move zero-copy ring bypass (null plies skip the 2 KB copy;
+direct hits resolve to the key-validated real-move ancestor; healing
+stops at null steps). Prev-B1 constexpr TUNED_EV dispatch + PawnEntry
+hoisting (conn passers, weak pawns, closedness index, passer-king
+terms, whole-bitboard outposts, kingFlags byte — struct stays 40 B).
+Prev-B3 kZeroHistRow branch-free continuation reads. Prev-B4
+recShiftOp/recShiftPOp bucket-base hoists + checkers-gated castling
+generation. T3b in-engine per-side lastScore for JNI/api callers
+(opt-in flag + resetGameContext; an early unconditional form leaked
+cross-game scores into move 1 and was caught in match A/B). N5 partial:
+fixed-movetime doomed-iteration guard (lastIterMs/5 fit test).
+REJECTED on match data: N5's crisis extension tier — cost 15–45 Elo at
+1.5+0.02 (fires on ordinary eval volatility, overspends into time
+trouble), neutral at 0.5+0.01, inert at fixed nodes. N7 trainer fixes
+shipped (per-bucket mean-centering to mu_ch[b]; active-row sparse Adam
+on FT_W) — no net trained (gates mandatory). Bench 165,888 / 1,361,920,
+perft 5 = 4,865,609, best moves identical at every depth; fuzznnue
+8.17M / fuzzsee 115.8M checks / fuzzcheck 132.8M moves, 0 mismatches.
+Elo vs 1.4.26: fixed-node 8k n=480 +17.4 ± 13.1; 0.5+0.01 n=240
++23.2 ± 18.1; 1.5+0.02 n=160 +37.1 ± 20.5; vs the first 1.4.27-cand
+pack at 1.5+0.02: +10.9 ± 22.7 (n=160).
+
 ---
 
 ## Public repository — V1.1 release (= internal 1.4.11)
@@ -5417,15 +6146,21 @@ checks pass on x86-64 / v3 / v4.
 
 ---
 
-## Public repository — V1.2 release (= internal 1.4.20)
+---
 
-New public release **V1.2**. Compared with the V1.1 build above, only the
-embedded NNUE network changed (`nnue_net.cpp` = net `v113-null19-ha-s025`,
-HISTORY §54–§57); engine code, clock manager and UCI host are unchanged, and
-`ttable.h` keeps its Windows-portable allocator. **Disclosure:** §55–§57
-(1.4.18–1.4.20) used Leela Chess Zero evaluations (robotmoon.com
-nnue-training-data binpacks, curated by Linmiao Xu / linrock, derived from
-Lc0 "test80" self-play data) as the supervised teacher instead of Stockfish;
-credits and scope are stated in README. Bench identity: `bench 9` = 230,912
-(matches the author's own 1.4.20 build); 33/33 protocol checks pass on
+## Public repository — V1.2 release, REBUILT (= internal 1.4.28) — supersedes the "V1.2 (internal 1.4.20)" entry
+
+The earlier public "V1.2" (internal 1.4.20) is **withdrawn**: its net was a
+regression and its published gain figures came from a sign-inverted gate
+harness (§58). The V1.1 build with the 1.4.16 net was likewise found weaker
+than the restored original net (§59). The rebuilt V1.2 is the 1.4.28 engine
+tree (§59–§63 and the 1.4.27/1.4.28 notes) with net `v96pre` (weight-for-
+weight identical to the original V1 net, verified) and the CCRL-ready UCI
+harness (`uci.cpp`) updated with the 1.4.26 per-side previous-score tracking
+(T3), the 1.4.27 incremental `position` continuation (T1), plus all earlier
+host fixes. `ttable.h` keeps its Windows-portable allocator; the Android/JNI
+layer is not part of the public repo. **Lc0 disclosure:** the Lc0-teacher
+experiments (§55–§57, §60) were rejected; no Lc0-trained net is in this
+release. Bench identity: `bench 9` = 165,888, `bench 14` = 1,361,920
+(match the author's own 1.4.28 build); 33/33 protocol checks pass on
 x86-64 / v3 / v4.
